@@ -2,12 +2,7 @@
  * Print the `spawn` declaration a dsh composition registers: the tool description
  * and every parameter description, as the model reads them.
  *
- * The plugin resolves the running installation's host packages when it loads.
- * Set `DSH_BIN` to that installation's `lib/bin.js` for the full composition
- * (jobs + sandbox); without it the profile anchor composes the sandbox-free one.
  */
-if (process.env.DSH_BIN !== undefined) process.argv[1] = process.env.DSH_BIN
-
 const mod: any = await import(new URL('../dist/index.js', import.meta.url).href)
 
 const fakeJobs = {
@@ -18,10 +13,10 @@ const fakeJobs = {
   read: () => ({ chunks: [], lossy: false, job: { output: { spillPaths: [] } } }),
 }
 
-function compose(sandboxed: boolean): { tool: any; composition: string } {
+function compose(): { tool: any; composition: string } {
   let captured: any
   const ctx: any = {
-    shell: sandboxed ? { sandboxMode: 'workspace-write' } : {},
+    shell: { sandboxMode: 'workspace-write' },
     get: (name: string) => (name === 'jobs' ? fakeJobs : name === 'sandboxPolicy' ? { resolve: () => ({ mode: 'workspace-write' }) } : undefined),
     logger: { warn: () => {} },
     systemPrompt: { section: () => {}, getSectionOrder: () => 0 },
@@ -32,16 +27,10 @@ function compose(sandboxed: boolean): { tool: any; composition: string } {
   }
   mod.apply(ctx)
   if (captured === undefined) throw new Error('spawn did not register')
-  return { tool: captured, composition: sandboxed ? 'jobs + sandbox' : 'sandbox-free' }
+  return { tool: captured, composition: 'jobs + sandbox' }
 }
 
-let composed: { tool: any; composition: string }
-try {
-  composed = compose(true)
-} catch {
-  console.error('note: the resolved host packages lack the sandbox helpers; set DSH_BIN to the running installation to see every parameter.')
-  composed = compose(false)
-}
+const composed = compose()
 
 const spec = composed.tool.parameters
 const required: string[] = spec.required ?? []

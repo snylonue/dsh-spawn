@@ -9,8 +9,46 @@ nodeLinker: hoisted
 # DSH packages declare each other as peers and the host supplies them.
 autoInstallPeers: false
 
-# pnpm treats an undecided dependency build as a hard error. vitest bundles its
-# own esbuild, and that postinstall only verifies a binary the platform package
-# already ships, so it stays off.
+# Each of these is false on purpose:
+#
+#   esbuild
+#     vitest bundles its own; the postinstall only verifies a binary the
+#     platform-specific package already ships.
+#   @deepseek-ai/dsh-subprocess-local, koffi, node-pty
+#     reachable only through the terminal path of the host packages used here;
+#     this plugin never opens a persistent terminal.
 allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': false
   esbuild: false
+  koffi: false
+  node-pty: false
+
+# 0.2.0-rc.2 host packages are newer than the configured minimumReleaseAge;
+# the development copies must match the runtime line this plugin targets.
+minimumReleaseAgeExclude:
+  - '@deepseek-ai/dsh-agent@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-bash-local@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-brand@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-home-paths@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-http-proxy@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-jobs-local@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-jobs@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-lazy-require@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-llm@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-output-retention@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-sandbox@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-scope@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-session-projection@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-session@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-shell-env@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-shell@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-subprocess-local@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-subprocess@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-system-prompt@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-timeout@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-tool-bash@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-tools@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-typert-protocol@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-util-crypto@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-util-values@0.2.0-rc.2'
+  - '@deepseek-ai/dsh-win32-process@0.2.0-rc.2'

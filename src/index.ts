@@ -23,105 +23,28 @@
  *
  * @module dsh-spawn
  */
-import { readFileSync } from 'node:fs'
 import { stat as hostStat } from 'node:fs/promises'
-import { createRequire } from 'node:module'
-import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
-import { pathToFileURL } from 'node:url'
-
-// ── host packages, loaded from the running installation ─────────────────────
-
-/**
- * The harness packages this plugin builds on are NOT imported by bare
- * specifier. A bundle installed from a local directory is materialised as a
- * symlink, so Node resolves this module's *real* path — the workspace — and a
- * bare `@deepseek-ai/dsh-tools` import fails with `ERR_MODULE_NOT_FOUND`. Even
- * when the copy lands inside the profile (an explicit `file:` install), the
- * profile's hoisted copies can belong to a different dsh version than the
- * running one, which would hand this plugin a different `HarnessError` class
- * and a different escalation vocabulary than the registry it registers into.
- *
- * Resolving through the *running* installation's own `package.json` returns the
- * exact module instance the harness loaded, at any dsh version, and keeps this
- * plugin's static imports to `node:` builtins only.
- *
- * @returns anchor directories to try, most specific first.
- */
-/** A short, stable description of an unknown thrown value. */
-function errorSummary(error: unknown): string {
-  if (typeof error === 'object' && error !== null) {
-    const candidate = error as { code?: unknown; message?: unknown }
-    if (typeof candidate.code === 'string') return candidate.code
-    if (typeof candidate.message === 'string') return candidate.message
-  }
-  return String(error)
-}
-
-function hostAnchors() {
-  const anchors = []
-  const bin = process.argv[1]
-  if (typeof bin === 'string' && bin.length > 0) {
-    // <install>/lib/node_modules/@deepseek-ai/dsh/lib/bin.js → the dsh package
-    const dshPackage = resolve(dirname(bin), '..')
-    try {
-      if (JSON.parse(readFileSync(join(dshPackage, 'package.json'), 'utf8')).name === '@deepseek-ai/dsh') {
-        anchors.push(dshPackage)
-      }
-    } catch {
-      // not a readable dsh package directory (Desktop, a test runner, a source
-      // checkout's script): fall through to the next anchor.
-    }
-  }
-  if (process.env.DSH_PROFILE_DIR) anchors.push(process.env.DSH_PROFILE_DIR)
-  return anchors
-}
-
-/**
- * Resolve one harness package to an absolute entry file.
- * @param name - the package specifier to resolve.
- * @returns the resolved entry file path.
- * @throws when no anchor can resolve it, naming every attempt.
- */
-function resolveHost(name: string): string {
-  const attempts = []
-  for (const anchor of hostAnchors()) {
-    try {
-      return createRequire(join(anchor, 'package.json')).resolve(name)
-    } catch (error) {
-      attempts.push(`${anchor}: ${errorSummary(error)}`)
-    }
-  }
-  try {
-    return createRequire(import.meta.url).resolve(name)
-  } catch (error) {
-    attempts.push(`module-relative: ${errorSummary(error)}`)
-  }
-  throw new Error(
-    `dsh-spawn: cannot resolve ${name} from the running dsh installation (${attempts.join('; ')}); ` +
-      'the bundle must be loaded by a dsh process whose installation provides the harness packages.',
-  )
-}
-
-const [toolsModule, llmModule, sandboxModule, shellModule] = await Promise.all(
-  [
-    '@deepseek-ai/dsh-tools',
-    '@deepseek-ai/dsh-llm',
-    '@deepseek-ai/dsh-sandbox',
-    '@deepseek-ai/dsh-shell',
-  ].map((name) => import(pathToFileURL(resolveHost(name)).href)),
-)
-
-const { defineTool, TOOL_ABORTED } = toolsModule
-const { HarnessError } = llmModule
-const {
+import { isAbsolute, sep } from 'node:path'
+import { defineTool, TOOL_ABORTED, type ToolCallView, type ToolResultView } from '@deepseek-ai/dsh-tools'
+import { HarnessError } from '@deepseek-ai/dsh-llm'
+import {
   ESCALATION_TARGETS,
   approveEscalation,
   escalationHintMarker,
   sandboxDenialMarker,
   sandboxPermissionsDescription,
   validateEscalationArgs,
-} = sandboxModule
-const { DSH_ENV_PREFIX } = shellModule
+  type SandboxMode,
+} from '@deepseek-ai/dsh-sandbox'
+import { DSH_ENV_PREFIX } from '@deepseek-ai/dsh-shell'
+
+// ── host packages ────────────────────────────────────────────────────────────
+//
+// `@deepseek-ai/dsh-tools` / `dsh-llm` / `dsh-sandbox` / `dsh-shell` are
+// peer dependencies: the dsh launcher installs a runtime resolution into
+// Node's ESM and CommonJS resolvers, and this package's peer declarations route
+// each bare request to the module instance the running harness loaded, even
+// when the bundle is a symlink.
 
 // ── types ───────────────────────────────────────────────────────────────────
 
@@ -137,7 +60,7 @@ interface StreamOutput {
 
 /** The executor's confinement facts for one run. */
 interface SandboxFacts {
-  mode: string
+  mode: SandboxMode
   denied: boolean
   enforcement?: string
   runnerFailed?: boolean
@@ -174,9 +97,10 @@ type SpawnValue =
 type RenderedSpawn = SpawnValue | (SpawnValue & { hints: string[] })
 
 /**
- * Host-plane handles stay `any` on purpose: this plugin resolves the running
- * installation's own services at runtime (see {@link resolveHost}), so the
- * executor, job registry and filesystem shapes belong to that installation.
+ * Host-plane handles stay `any` on purpose: the running installation's own
+ * services are handed in through `ctx`, so the executor, job registry and
+ * filesystem shapes belong to that installation rather than to a type owned
+ * here.
  */
 type HostProcess = any
 type JobRead = any
@@ -242,7 +166,7 @@ interface SpawnContext {
 
 /** The resolution facts captured when the `spawn` tool was built. */
 interface SpawnToolOptions {
-  escalationModes: string[]
+  escalationModes: readonly string[]
   resolveSandboxPolicy(spawn: SpawnContext): any
 }
 
@@ -321,7 +245,7 @@ function displayCommand(command: string, args: string[] | undefined): string {
  * Sandbox facts worth the terminal detail: a runner that never ran the
  * command, or a denial (with the escalation hint this composition offers).
  */
-function sandboxNotes(sandbox: SandboxFacts | undefined, escalationModes: string[]): string[] {
+function sandboxNotes(sandbox: SandboxFacts | undefined, escalationModes: readonly string[]): string[] {
   if (sandbox?.runnerFailed) {
     return [
       `[sandbox: the sandbox runner itself failed under ${sandbox.mode} mode — the command did not run; this is a sandbox problem, not a command failure]`,
@@ -336,7 +260,7 @@ function sandboxNotes(sandbox: SandboxFacts | undefined, escalationModes: string
 }
 
 /** Map a settled background process onto the generic job-outcome vocabulary. */
-function processOutcome(proc: HostProcess, escalationModes: string[] = []): JobOutcome {
+function processOutcome(proc: HostProcess, escalationModes: readonly string[] = []): JobOutcome {
   const base =
     proc.status === 'killed'
       ? {
@@ -437,7 +361,7 @@ function spawnBody(result: ShellRunResult): string {
  * command, a deadline, a stop, or a promotion. Every other fact about a run is
  * carried by its own field, so a consumer reads fields instead of markers.
  */
-function spawnHints(value: SpawnValue, escalationModes: string[] = []): string[] {
+function spawnHints(value: SpawnValue, escalationModes: readonly string[] = []): string[] {
   if (value.kind === 'promoted') {
     return [
       `still running after ${value.timeoutMs}ms; moved to background job ${value.jobId}`,
@@ -470,7 +394,7 @@ function spawnHints(value: SpawnValue, escalationModes: string[] = []): string[]
  * phrase. Nothing is flattened into prose, so a consumer reads fields instead
  * of parsing markers.
  */
-function structuredResult(value: SpawnValue, escalationModes: string[] = []): RenderedSpawn {
+function structuredResult(value: SpawnValue, escalationModes: readonly string[] = []): RenderedSpawn {
   const hints = spawnHints(value, escalationModes)
   return hints.length === 0 ? value : { ...value, hints }
 }
@@ -481,7 +405,7 @@ function renderPromoted(promoted: Extract<SpawnValue, { kind: 'promoted' }>): st
 }
 
 /** Shape the one consuming registry read a foreground call embeds in its result. */
-function renderJobRead(delta: string, lossy: boolean, spillPaths: string[], sandbox: SandboxFacts | undefined, escalationModes: string[] = []): string {
+function renderJobRead(delta: string, lossy: boolean, spillPaths: string[], sandbox: SandboxFacts | undefined, escalationModes: readonly string[] = []): string {
   const notices = []
   if (lossy) {
     notices.push(
@@ -540,7 +464,7 @@ function canonicalRunResult(result: ShellRunResult): ShellRunResult {
 const BACKGROUND_OUTPUT_PROPERTIES = {
   kind: { type: 'string', required: true, const: 'background' },
   jobId: { type: 'string', required: true },
-}
+} as const
 
 function spawnDescription() {
   return `Run one program directly — no shell — and return its stdout/stderr: \`command\` is a PATH name or absolute path, \`args\` its argv. Nothing is interpreted by a shell: no globbing, pipes, redirection, or variable expansion; pass the program and its arguments separately, never a command line, and compose pipelines in the program instead. Managed \`${DSH_ENV_PREFIX}*\` variables expose current harness environment facts. \`background: true\` starts a job (collect with \`job_output\`, stop with \`job_kill\`); a foreground call that reaches its timeout is promoted to one. Long output is truncated to its tail and the full path is reported when available. Read the structured result (\`exitCode\`/\`signal\`, \`stdout\`/\`stderr\`, \`sandbox\`); a non-zero exit is a normal result, not a tool error. Programs may run under a file sandbox; a blocked file operation is reported as \`[sandbox: file access denied under <mode> mode]\`, a policy denial: do not retry another way. Before any delete or move, verify the resolved absolute target path.`
@@ -566,7 +490,7 @@ function validateSpawnArgs(args: SpawnArgs, effectiveMode: string | undefined): 
   validateEscalationArgs(args.sandbox_permissions, justification)
 }
 
-function presentSpawnCall(args: SpawnArgs) {
+function presentSpawnCall(args: SpawnArgs): ToolCallView {
   const command = displayCommand(args.command, args.args)
   if (args.background === true) {
     return {
@@ -608,7 +532,7 @@ function presentedResult(result: PresentResult): any {
   }
 }
 
-function presentSpawnResult(_args: SpawnArgs, result: PresentResult) {
+function presentSpawnResult(_args: SpawnArgs, result: PresentResult): ToolResultView | undefined {
   const value = result.isError ? undefined : presentedResult(result)
   if (value?.kind === 'foreground') {
     return {
@@ -898,7 +822,7 @@ function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: S
         { type: 'text', text: JSON.stringify(structuredResult(value, escalationModes), null, 2) },
       ],
     },
-    async execute(args: SpawnArgs, spawn: SpawnContext) {
+    async execute(args: SpawnArgs, spawn: SpawnContext): Promise<SpawnValue> {
       const standingPolicy = resolveSandboxPolicy(spawn)
       const commandLine = buildCommandLine(args.command, args.args)
       validateSpawnArgs(args, standingPolicy?.mode)
