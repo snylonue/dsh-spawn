@@ -1,0 +1,48 @@
+{
+  "name": "dsh-spawn",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Typed argv process and path API (spawn / which / stat / list_dir) for DeepSeek Harness, mounted by the PTC-spawn agent preset instead of a shell.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "dsh": "^0.2.0-rc.2"
+  },
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "test": "pnpm build && vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  },
+  "meta": {
+    "title": "Spawn",
+    "description": "argv process and path tools: spawn, which, stat, list_dir — never a shell."
+  }
+}

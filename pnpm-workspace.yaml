@@ -1,0 +1,16 @@
+packages:
+  - .
+
+# Hoisted, so anything this package resolves for a DSH peer meets the SAME
+# module instances the host uses; a nested layout would hand the plugin its own
+# copy of e.g. @deepseek-ai/cordis and break service-registration identity.
+nodeLinker: hoisted
+
+# DSH packages declare each other as peers and the host supplies them.
+autoInstallPeers: false
+
+# pnpm treats an undecided dependency build as a hard error. vitest bundles its
+# own esbuild, and that postinstall only verifies a binary the platform package
+# already ships, so it stays off.
+allowBuilds:
+  esbuild: false

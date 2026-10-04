@@ -1,0 +1,8 @@
+node_modules/
+dist/
+dbg*.mjs
+probe-*.mjs
+
+/.artifacts
+backup/
+*.bak-*
