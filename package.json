@@ -74,6 +74,6 @@
   },
   "meta": {
     "title": "Spawn",
-    "description": "argv process and path tools: spawn, which, stat, list_dir — never a shell."
+    "description": "argv process and path tools: spawn, stat, list_dir — never a shell."
   }
 }

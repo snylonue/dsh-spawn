@@ -1,6 +1,6 @@
 # dsh-spawn
 
-Provides a `spawn` tool that executes command directly without shell, and `which`, `stat`, and `list_dir` helpers.
+Provides a `spawn` tool that executes a command directly without shell, and `stat` and `list_dir` helpers.
 
 A preset (`PTC-spawn` (id `ptc-spawn`)) is provided, which is based on PTC mode and replaces `shell` with above tools.
 

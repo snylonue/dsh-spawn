@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ARGS, composeSpawn, composeWhich, foreground, rendered, wrapped } from './helpers.js'
+import { ARGS, composeSpawn, foreground, rendered, wrapped } from './helpers.js'
 
 const NL = String.fromCharCode(10)
 
@@ -47,23 +47,6 @@ describe('spawn rendering', () => {
     const promoted = rendered(tool, { kind: 'promoted', jobId: 'job-2', timeoutMs: 5000, output: 'partial' })
     expect(promoted.jobId).toBe('job-2')
     expect(promoted.hints).toHaveLength(2)
-  })
-})
-
-describe('which resolution', () => {
-  it('resolves against the environment the shell seam would hand spawn', async () => {
-    const { tool, shellResolves, executableCalls } = await composeWhich({ env: { PATH: '/devshell/bin' } })
-    const value = await tool.execute({ command: 'uv' }, { callId: 'c', signal: new AbortController().signal })
-    expect(value).toEqual({ path: '/resolved/uv' })
-    expect(shellResolves).toEqual([{ command: 'uv' }])
-    expect(executableCalls).toEqual([{ command: 'uv', path: '/devshell/bin' }])
-  })
-
-  it('falls back to the execution world PATH when no shell spec can be prepared', async () => {
-    const { tool, executableCalls } = await composeWhich({ resolveThrows: true })
-    const value = await tool.execute({ command: 'git' }, { callId: 'c', signal: new AbortController().signal })
-    expect(value).toEqual({ path: '/resolved/git' })
-    expect(executableCalls).toEqual([{ command: 'git', path: undefined }])
   })
 })
 

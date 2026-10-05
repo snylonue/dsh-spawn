@@ -2,13 +2,12 @@
  * `dsh-spawn` — the typed process/path API that replaces `bash` in the
  * `PTC-spawn` agent preset (id `ptc-spawn`).
  *
- * Four model-facing tools, all callable inside a `run_code` program as
+ * Three model-facing tools, all callable inside a `run_code` program as
  * `tools.<name>(...)`:
  *
  * - `spawn`      run one program by argv (never a shell string), confined by the
  *               mounted shell executor's sandbox policy and escalatable through
  *               the shared approval choreography.
- * - `which`     resolve a program name on the PATH a spawned program would receive.
  * - `stat`      sandbox-aware metadata for one path.
  * - `list_dir`  bounded, depth-limited directory listing.
  *
@@ -56,10 +55,9 @@ import {
 import type { JobId, JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
 import { FiberState, type Context } from '@deepseek-ai/cordis'
 // The empty type-only imports pull in each host package's Cordis `Context`
-// augmentation (`ctx.shellEnv`, `ctx.subprocess`, `ctx.fs`,
-// `ctx.systemPrompt`) without adding any of them to the runtime import graph.
+// augmentation (`ctx.shellEnv`, `ctx.fs`, `ctx.systemPrompt`) without
+// adding any of them to the runtime import graph.
 import type {} from '@deepseek-ai/dsh-shell-env'
-import type {} from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 
@@ -97,10 +95,6 @@ interface AttachedJob {
   process(): ShellExecution | undefined
   stopped(): string | undefined
 }
-
-/** The `which` argument and value. */
-interface NameArgs { command: string }
-interface WhichValue { path: string | null }
 
 /** The `stat` value. */
 interface StatValue {
@@ -860,53 +854,6 @@ async function hostMtime(processPath: string | undefined): Promise<number | unde
   }
 }
 
-function whichTool(ctx: Context): ToolDefinition {
-  return defineTool({
-    name: 'which',
-    description:
-      'Resolve a program name against the PATH a spawned program would receive (including any workspace environment injected at the shell seam) and return its absolute path. Returns `path: null` when nothing matches or the name is not a plain program name.',
-    parameters: {
-      command: {
-        type: 'string',
-        required: true,
-        description: 'Bare program name (for example `rg`, `git`, `pnpm`) or an absolute path to verify.',
-      },
-    },
-    output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: { path: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] } },
-      },
-      render: (_args: NameArgs, value: WhichValue) => [{ type: 'text', text: value.path ?? '(not found)' }],
-    },
-    isConcurrencySafe: () => true,
-    async execute(args: NameArgs, spawn: ToolRunContext) {
-      // Resolve against the environment a `spawn` call would run under, so a
-      // workspace environment injected at the shell seam (for example
-      // dsh-direnv's `ctx.shell.resolve` wrapper) contributes its PATH here
-      // too; otherwise `spawn` could run a workspace-provided program that
-      // `which` reports as missing. `resolve` only prepares a spec — nothing
-      // executes. A shell that cannot prepare one falls back to the execution
-      // world's own PATH, which is what this tool used before.
-      let env: Record<string, string> | undefined
-      try {
-        const prepared = ctx.shell.resolve({ command: args.command })
-        if (typeof prepared === 'object' && prepared !== null && typeof prepared.env === 'object' && prepared.env !== null) {
-          env = prepared.env
-        }
-      } catch {
-        // Keep the fallback.
-      }
-      try {
-        return { path: await ctx.subprocess.resolveExecutable(args.command, env, spawn.signal) }
-      } catch {
-        return { path: null }
-      }
-    },
-  })
-}
-
 function statTool(ctx: Context): ToolDefinition {
   return defineTool({
     name: 'stat',
@@ -1078,10 +1025,6 @@ export function apply(ctx: Context): void {
       unregister()
       if (ctx.fiber.state === FiberState.ACTIVE) foregroundOnly = ctx.tools.register(spawnTool(ctx, undefined, options))
     })
-  })
-
-  ctx.inject(['subprocess'], (subprocessCtx: Context) => {
-    subprocessCtx.tools.register(whichTool(subprocessCtx))
   })
 
   ctx.inject(['fs'], (fsCtx: Context) => {
