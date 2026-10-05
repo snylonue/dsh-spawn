@@ -25,7 +25,15 @@
  */
 import { stat as hostStat } from 'node:fs/promises'
 import { isAbsolute, sep } from 'node:path'
-import { defineTool, TOOL_ABORTED, type ToolCallView, type ToolResultView } from '@deepseek-ai/dsh-tools'
+import {
+  defineTool,
+  TOOL_ABORTED,
+  type ToolCallView,
+  type ToolDefinition,
+  type ToolResult,
+  type ToolResultView,
+  type ToolRunContext,
+} from '@deepseek-ai/dsh-tools'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
 import {
   ESCALATION_TARGETS,
@@ -34,9 +42,22 @@ import {
   sandboxDenialMarker,
   sandboxPermissionsDescription,
   validateEscalationArgs,
+  type SandboxExecutionPolicy,
   type SandboxMode,
 } from '@deepseek-ai/dsh-sandbox'
-import { DSH_ENV_PREFIX } from '@deepseek-ai/dsh-shell'
+import {
+  DSH_ENV_PREFIX,
+  type CollectedOutput,
+  type ShellExecSpec,
+  type ShellExecution,
+  type ShellExecutor,
+  type ShellRunResult,
+  type ShellSandboxInfo,
+} from '@deepseek-ai/dsh-shell'
+import type { JobId, JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
+import type { ShellEnvRegistry } from '@deepseek-ai/dsh-shell-env'
+import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
+import type { FileSystem } from '@deepseek-ai/dsh-fs'
 
 // ── host packages ────────────────────────────────────────────────────────────
 //
@@ -51,39 +72,6 @@ import { DSH_ENV_PREFIX } from '@deepseek-ai/dsh-shell'
 /** The JSON subset every tool value and host DTO here is made of. */
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
-/** One captured stream: its text, whether it was clipped, and where the rest spilled. */
-interface StreamOutput {
-  text: string
-  truncated: boolean
-  spillPath?: string
-}
-
-/** The executor's confinement facts for one run. */
-interface SandboxFacts {
-  mode: SandboxMode
-  denied: boolean
-  enforcement?: string
-  runnerFailed?: boolean
-}
-
-/** One settled run, as `ctx.shell.execute(...).result()` reports it. */
-interface ShellRunResult {
-  exitCode: number | null
-  signal: string | null
-  timedOut: boolean
-  aborted: boolean
-  timeoutMs: number
-  stdout: StreamOutput
-  stderr: StreamOutput
-  sandbox?: SandboxFacts
-}
-
-/** One job outcome in the generic job vocabulary. */
-interface JobOutcome {
-  status: string
-  detail: string
-}
-
 /**
  * The canonical `spawn` value: the discriminated union its output schema
  * declares, plus the stop reason a foreground call can additionally carry.
@@ -96,21 +84,16 @@ type SpawnValue =
 /** The structured render: the value plus the advisory hints, when any. */
 type RenderedSpawn = SpawnValue | (SpawnValue & { hints: string[] })
 
-/**
- * Host-plane handles stay `any` on purpose: the running installation's own
- * services are handed in through `ctx`, so the executor, job registry and
- * filesystem shapes belong to that installation rather than to a type owned
- * here.
- */
-type HostProcess = any
-type JobRead = any
-type HostTool = any
-type JobRegistry = any
+declare module '@deepseek-ai/dsh-jobs' {
+  interface JobKindMap {
+    spawn: 'spawn'
+  }
+}
 
 /** One registered background job, as `startJob` hands it to the waiter. */
 interface AttachedJob {
-  id: string
-  process(): HostProcess | undefined
+  id: JobId
+  process(): ShellExecution | undefined
   stopped(): string | undefined
 }
 
@@ -141,7 +124,7 @@ interface SpawnArgs {
   stdin?: string
   env?: Record<string, string>
   background?: boolean
-  sandbox_permissions?: string
+  sandbox_permissions?: SandboxMode
   justification?: string
 }
 
@@ -151,32 +134,18 @@ interface PathArgs {
   depth?: number
 }
 
-/** A normalized model-facing tool result, as presenters receive it. */
-interface PresentResult {
-  content: { type: string; text?: string }[]
-  isError: boolean
-}
-
-/** One tool execution: agent, call identity, cancellation and nesting facts. */
-interface SpawnContext {
-  agent?: { id: string; session: { header: { cwd?: string } } }
-  callId: string
-  signal: AbortSignal
-}
-
 /** The resolution facts captured when the `spawn` tool was built. */
 interface SpawnToolOptions {
-  escalationModes: readonly string[]
-  resolveSandboxPolicy(spawn: SpawnContext): any
+  escalationModes: readonly SandboxMode[]
+  resolveSandboxPolicy(spawn: ToolRunContext): SandboxExecutionPolicy | undefined
 }
 
 /**
- * The plugin-context members this plugin touches. Members whose shape belongs
- * to a dynamically resolved host service stay `any`.
+ * The plugin-context members this plugin touches.
  */
 interface PluginContext {
-  shell: any
-  shellEnv: { collect(spawn: SpawnContext): JsonValue }
+  shell: ShellExecutor
+  shellEnv: ShellEnvRegistry
   get(name: string): any
   inject(names: string[], apply: (ctx: PluginContext) => void): void
   logger: { warn(...args: unknown[]): void }
@@ -184,10 +153,10 @@ interface PluginContext {
     section(section: { name: string; order: number; text: string }): void
     getSectionOrder(name: string): number
   }
-  tools: { register(definition: HostTool): () => void }
+  tools: { register(definition: ToolDefinition): () => void }
   jobs?: JobRegistry
-  subprocess?: any
-  fs?: any
+  subprocess?: SubprocessRuntime
+  fs?: FileSystem
   effect(dispose: () => void, name?: string): void
   fiber: { state: number }
 }
@@ -245,7 +214,7 @@ function displayCommand(command: string, args: string[] | undefined): string {
  * Sandbox facts worth the terminal detail: a runner that never ran the
  * command, or a denial (with the escalation hint this composition offers).
  */
-function sandboxNotes(sandbox: SandboxFacts | undefined, escalationModes: readonly string[]): string[] {
+function sandboxNotes(sandbox: ShellSandboxInfo | undefined, escalationModes: readonly string[]): string[] {
   if (sandbox?.runnerFailed) {
     return [
       `[sandbox: the sandbox runner itself failed under ${sandbox.mode} mode — the command did not run; this is a sandbox problem, not a command failure]`,
@@ -260,8 +229,8 @@ function sandboxNotes(sandbox: SandboxFacts | undefined, escalationModes: readon
 }
 
 /** Map a settled background process onto the generic job-outcome vocabulary. */
-function processOutcome(proc: HostProcess, escalationModes: readonly string[] = []): JobOutcome {
-  const base =
+function processOutcome(proc: ShellExecution, escalationModes: readonly string[] = []): JobOutcome {
+  const base: JobOutcome =
     proc.status === 'killed'
       ? {
           status: 'killed',
@@ -276,8 +245,8 @@ function processOutcome(proc: HostProcess, escalationModes: readonly string[] = 
 }
 
 /** The process's non-consuming stream readers as registry pull sources. */
-function processSources(proc: () => HostProcess | undefined) {
-  const source = (channel: string) => ({
+function processSources(proc: () => ShellExecution | undefined) {
+  const source = (channel: 'stdout' | 'stderr') => ({
     channel,
     read: (fromByte: number) => {
       const live = proc()
@@ -290,7 +259,7 @@ function processSources(proc: () => HostProcess | undefined) {
 }
 
 /** The ring chunks of one consuming registry read, rendered as the shell tools render a process read. */
-function ringDelta(chunks: { channel: string; text: string }[]): string {
+function ringDelta(chunks: readonly { channel?: string; text: string }[]): string {
   const out = chunks
     .filter((chunk) => chunk.channel !== 'stderr')
     .map((chunk) => chunk.text)
@@ -304,9 +273,9 @@ function ringDelta(chunks: { channel: string; text: string }[]): string {
 }
 
 /** Adapt asynchronous shell preparation after job admission without exposing a partial process. */
-function processJob(start: (signal: AbortSignal) => Promise<HostProcess>, outcome: (proc: HostProcess) => JobOutcome): { cancel(reason: unknown): void; done: Promise<JobOutcome> } {
+function processJob(start: (signal: AbortSignal) => Promise<ShellExecution>, outcome: (proc: ShellExecution) => JobOutcome): { cancel(reason: unknown): void; done: Promise<JobOutcome> } {
   const controller = new AbortController()
-  let process: HostProcess
+  let process: ShellExecution | undefined
   return {
     cancel: (reason: unknown) => {
       if (controller.signal.aborted) return
@@ -335,7 +304,7 @@ function processJob(start: (signal: AbortSignal) => Promise<HostProcess>, outcom
 // ── rendering ───────────────────────────────────────────────────────────────
 
 /** Append the truncation notice (with the full-output spill path) to a stream's text. */
-function streamText(output: StreamOutput): string {
+function streamText(output: CollectedOutput): string {
   if (!output.truncated) return output.text
   return `${output.text}\n[output truncated; full output: ${output.spillPath ?? '(unavailable)'}]`
 }
@@ -405,7 +374,7 @@ function renderPromoted(promoted: Extract<SpawnValue, { kind: 'promoted' }>): st
 }
 
 /** Shape the one consuming registry read a foreground call embeds in its result. */
-function renderJobRead(delta: string, lossy: boolean, spillPaths: string[], sandbox: SandboxFacts | undefined, escalationModes: readonly string[] = []): string {
+function renderJobRead(delta: string, lossy: boolean, spillPaths: readonly string[], sandbox: ShellSandboxInfo | undefined, escalationModes: readonly string[] = []): string {
   const notices = []
   if (lossy) {
     notices.push(
@@ -433,7 +402,7 @@ function toolAborted() {
 
 /** Detach the executor DTO from readonly Service Definition types into plain JSON data. */
 function canonicalRunResult(result: ShellRunResult): ShellRunResult {
-  const output = (stream: StreamOutput): StreamOutput => ({
+  const output = (stream: CollectedOutput): CollectedOutput => ({
     text: stream.text,
     truncated: stream.truncated,
     ...(stream.spillPath !== undefined ? { spillPath: stream.spillPath } : {}),
@@ -470,7 +439,7 @@ function spawnDescription() {
   return `Run one program directly — no shell — and return its stdout/stderr: \`command\` is a PATH name or absolute path, \`args\` its argv. Nothing is interpreted by a shell: no globbing, pipes, redirection, or variable expansion; pass the program and its arguments separately, never a command line, and compose pipelines in the program instead. Managed \`${DSH_ENV_PREFIX}*\` variables expose current harness environment facts. \`background: true\` starts a job (collect with \`job_output\`, stop with \`job_kill\`); a foreground call that reaches its timeout is promoted to one. Long output is truncated to its tail and the full path is reported when available. Read the structured result (\`exitCode\`/\`signal\`, \`stdout\`/\`stderr\`, \`sandbox\`); a non-zero exit is a normal result, not a tool error. Programs may run under a file sandbox; a blocked file operation is reported as \`[sandbox: file access denied under <mode> mode]\`, a policy denial: do not retry another way. Before any delete or move, verify the resolved absolute target path.`
 }
 
-function validateSpawnArgs(args: SpawnArgs, effectiveMode: string | undefined): void {
+function validateSpawnArgs(args: SpawnArgs, effectiveMode: SandboxMode | undefined): void {
   if (args.description.trim().length === 0) throw new Error('invalid description: expected a non-empty string')
   if (args.timeoutMs !== undefined && (!Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0)) {
     throw new Error(`invalid timeoutMs: expected a positive number, got ${JSON.stringify(args.timeoutMs)}`)
@@ -510,7 +479,7 @@ function presentSpawnCall(args: SpawnArgs): ToolCallView {
 }
 
 /** The raw model-facing text of a result, when it is a single text block. */
-function resultText(result: PresentResult): string | undefined {
+function resultText(result: ToolResult): string | undefined {
   const block = result.content.length === 1 ? result.content[0] : undefined
   return block?.type === 'text' ? block.text : undefined
 }
@@ -521,7 +490,7 @@ function resultText(result: PresentResult): string | undefined {
  * their own structure; a failed call renders error text instead and yields
  * undefined, which the generic fallback then shows verbatim.
  */
-function presentedResult(result: PresentResult): any {
+function presentedResult(result: ToolResult): any {
   const raw = resultText(result)
   if (raw === undefined) return undefined
   try {
@@ -532,7 +501,7 @@ function presentedResult(result: PresentResult): any {
   }
 }
 
-function presentSpawnResult(_args: SpawnArgs, result: PresentResult): ToolResultView | undefined {
+function presentSpawnResult(_args: SpawnArgs, result: ToolResult): ToolResultView | undefined {
   const value = result.isError ? undefined : presentedResult(result)
   if (value?.kind === 'foreground') {
     return {
@@ -563,7 +532,7 @@ function presentSpawnResult(_args: SpawnArgs, result: PresentResult): ToolResult
  * defaulting as the fallback. A resolved sandbox-policy root wins so cwd and
  * confinement use the exact same per-call identity.
  */
-function resolveWorkdir(modelWorkdir: string | undefined, spawn: SpawnContext, policyWorkspaceRoot: string | undefined): string | undefined {
+function resolveWorkdir(modelWorkdir: string | undefined, spawn: ToolRunContext, policyWorkspaceRoot: string | undefined): string | undefined {
   const headerCwd = spawn.agent?.session.header.cwd
   const sessionCwd = policyWorkspaceRoot ?? headerCwd
   if (modelWorkdir === undefined) return sessionCwd
@@ -580,14 +549,17 @@ function resolveWorkdir(modelWorkdir: string | undefined, spawn: SpawnContext, p
  * @param options - resolution facts captured at apply time.
  * @returns the registry-ready tool definition.
  */
-function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: SpawnToolOptions): HostTool {
+function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: SpawnToolOptions): ToolDefinition {
   const { escalationModes, resolveSandboxPolicy } = options
   const background = jobs !== undefined
   const promote = background
 
-  const approveSpawnEscalation = (mode: string, justification: string, spawn: SpawnContext, standingPolicy: any) => {
+  const approveSpawnEscalation = (mode: SandboxMode, justification: string, spawn: ToolRunContext, standingPolicy: SandboxExecutionPolicy | undefined) => {
     if (escalationModes.length === 0) {
       throw new Error('sandbox_permissions is not available in this composition (no sandboxing executor to escalate)')
+    }
+    if (standingPolicy === undefined) {
+      throw new Error('sandbox_permissions is not available without a sandbox execution policy')
     }
     return approveEscalation(
       { requestedMode: mode, justification, effectiveMode: standingPolicy.mode, subject: 'command' },
@@ -601,8 +573,8 @@ function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: S
     )
   }
 
-  const startJob = (registry: JobRegistry, args: SpawnArgs, spawn: SpawnContext, spec: any): AttachedJob => {
-    let proc: HostProcess
+  const startJob = (registry: JobRegistry, args: SpawnArgs, spawn: ToolRunContext, spec: ShellExecSpec): AttachedJob => {
+    let proc: ShellExecution
     let stopped: string | undefined
     return {
       id: registry.start({
@@ -632,10 +604,10 @@ function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: S
     }
   }
 
-  const waitOnJob = async (registry: JobRegistry, attached: AttachedJob, spawn: SpawnContext, spec: any): Promise<SpawnValue> => {
+  const waitOnJob = async (registry: JobRegistry, attached: AttachedJob, spawn: ToolRunContext, spec: ShellExecSpec): Promise<SpawnValue> => {
     const owner = spawn.agent?.id
     const timeoutMs = spec.timeoutMs
-    const stop = async (reason: unknown) => {
+    const stop = async (reason: string) => {
       registry.kill(attached.id, owner, reason)
       const settled = await registry.wait(attached.id, timeoutMs, owner)
       if (settled.status !== 'running' && settled.status !== 'stopping') registry.remove(attached.id, owner)
@@ -822,7 +794,7 @@ function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: S
         { type: 'text', text: JSON.stringify(structuredResult(value, escalationModes), null, 2) },
       ],
     },
-    async execute(args: SpawnArgs, spawn: SpawnContext): Promise<SpawnValue> {
+    async execute(args: SpawnArgs, spawn: ToolRunContext): Promise<SpawnValue> {
       const standingPolicy = resolveSandboxPolicy(spawn)
       const commandLine = buildCommandLine(args.command, args.args)
       validateSpawnArgs(args, standingPolicy?.mode)
@@ -830,7 +802,10 @@ function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: S
         args.sandbox_permissions !== undefined && args.justification !== undefined
           ? await approveSpawnEscalation(args.sandbox_permissions, args.justification, spawn, standingPolicy)
           : undefined
-      const policy = approvedMode === undefined ? standingPolicy : { ...standingPolicy, mode: approvedMode }
+      const policy =
+        approvedMode === undefined || standingPolicy === undefined
+          ? standingPolicy
+          : { ...standingPolicy, mode: approvedMode }
       const workdir = resolveWorkdir(args.cwd, spawn, standingPolicy?.workspaceRoot)
       const dshEnv = ctx.shellEnv.collect(spawn)
       const request = {
@@ -878,7 +853,7 @@ function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: S
 // ── query tools ─────────────────────────────────────────────────────────────
 
 /** The session workspace the path tools resolve relative paths against. */
-function sessionCwd(spawn: SpawnContext): string | undefined {
+function sessionCwd(spawn: ToolRunContext): string | undefined {
   return spawn.agent?.session.header.cwd
 }
 
@@ -897,7 +872,9 @@ async function hostMtime(processPath: string | undefined): Promise<number | unde
   }
 }
 
-function whichTool(ctx: PluginContext): HostTool {
+function whichTool(ctx: PluginContext): ToolDefinition {
+  const subprocess = ctx.subprocess
+  if (subprocess === undefined) throw new Error('dsh-spawn: which requires ctx.subprocess')
   return defineTool({
     name: 'which',
     description:
@@ -918,7 +895,7 @@ function whichTool(ctx: PluginContext): HostTool {
       render: (_args: NameArgs, value: WhichValue) => [{ type: 'text', text: value.path ?? '(not found)' }],
     },
     isConcurrencySafe: () => true,
-    async execute(args: NameArgs, spawn: SpawnContext) {
+    async execute(args: NameArgs, spawn: ToolRunContext) {
       // Resolve against the environment a `spawn` call would run under, so a
       // workspace environment injected at the shell seam (for example
       // dsh-direnv's `ctx.shell.resolve` wrapper) contributes its PATH here
@@ -936,7 +913,7 @@ function whichTool(ctx: PluginContext): HostTool {
         // Keep the fallback.
       }
       try {
-        return { path: await ctx.subprocess.resolveExecutable(args.command, env, spawn.signal) }
+        return { path: await subprocess.resolveExecutable(args.command, env, spawn.signal) }
       } catch {
         return { path: null }
       }
@@ -944,7 +921,9 @@ function whichTool(ctx: PluginContext): HostTool {
   })
 }
 
-function statTool(ctx: PluginContext): HostTool {
+function statTool(ctx: PluginContext): ToolDefinition {
+  const fs = ctx.fs
+  if (fs === undefined) throw new Error('dsh-spawn: stat requires ctx.fs')
   return defineTool({
     name: 'stat',
     description:
@@ -979,11 +958,12 @@ function statTool(ctx: PluginContext): HostTool {
           : [{ type: 'text', text: `${value.path}: (absent)` }],
     },
     isConcurrencySafe: () => true,
-    async execute(args: PathArgs, spawn: SpawnContext) {
-      const target = await ctx.fs.resolve(args.path, { cwd: sessionCwd(spawn), signal: spawn.signal })
-      const info = await ctx.fs.stat(target, spawn.signal)
+    async execute(args: PathArgs, spawn: ToolRunContext) {
+      const cwd = sessionCwd(spawn)
+      const target = await fs.resolve(args.path, { ...(cwd !== undefined ? { cwd } : {}), signal: spawn.signal })
+      const info = await fs.stat(target, spawn.signal)
       if (info === undefined) return { path: target.displayPath, exists: false }
-      const mtimeMs = await hostMtime(ctx.fs.processPath(target))
+      const mtimeMs = await hostMtime(fs.processPath(target))
       return {
         path: target.displayPath,
         exists: true,
@@ -995,7 +975,9 @@ function statTool(ctx: PluginContext): HostTool {
   })
 }
 
-function listDirTool(ctx: PluginContext): HostTool {
+function listDirTool(ctx: PluginContext): ToolDefinition {
+  const fs = ctx.fs
+  if (fs === undefined) throw new Error('dsh-spawn: list_dir requires ctx.fs')
   return defineTool({
     name: 'list_dir',
     description: `List the entries of one directory in the session filesystem, one level at a time by default. \`depth\` recurses into subdirectories (maximum ${LIST_DIR_MAX_DEPTH}); results stop at ${LIST_DIR_MAX_ENTRIES} entries and report \`truncated\`. Entries are returned in stable name order and never include file contents.`,
@@ -1045,8 +1027,9 @@ function listDirTool(ctx: PluginContext): HostTool {
       ],
     },
     isConcurrencySafe: () => true,
-    async execute(args: PathArgs, spawn: SpawnContext) {
-      const root = await ctx.fs.resolve(args.path, { cwd: sessionCwd(spawn), signal: spawn.signal })
+    async execute(args: PathArgs, spawn: ToolRunContext) {
+      const cwd = sessionCwd(spawn)
+      const root = await fs.resolve(args.path, { ...(cwd !== undefined ? { cwd } : {}), signal: spawn.signal })
       const depth = Math.max(1, Math.min(LIST_DIR_MAX_DEPTH, args.depth ?? 1))
       const entries = []
       let truncated = false
@@ -1054,7 +1037,7 @@ function listDirTool(ctx: PluginContext): HostTool {
       while (level.length > 0 && !truncated) {
         const next = []
         for (const item of level) {
-          const children = await ctx.fs.listDir(item.target, spawn.signal)
+          const children = await fs.listDir(item.target, spawn.signal)
           for (const child of children) {
             if (entries.length >= LIST_DIR_MAX_ENTRIES) {
               truncated = true
@@ -1094,7 +1077,7 @@ export function apply(ctx: PluginContext): void {
   if (defaultMode !== undefined && sandboxPolicy === undefined) {
     throw new Error('dsh-spawn: the mounted shell executor confines but ctx.sandboxPolicy is missing')
   }
-  const resolveSandboxPolicy = (spawn: SpawnContext) =>
+  const resolveSandboxPolicy = (spawn: ToolRunContext) =>
     sandboxPolicy?.resolve(spawn.agent === undefined ? {} : { session: spawn.agent.session })
 
   ctx.systemPrompt.section({
