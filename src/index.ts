@@ -75,10 +75,33 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
  * The canonical `spawn` value: the discriminated union its output schema
  * declares, plus the stop reason a foreground call can additionally carry.
  */
+/** One captured stream's model-facing value. */
+type StreamValue = { text: string; truncated: boolean; spillPath?: string }
+
+/**
+ * The canonical `spawn` value: the discriminated union its output schema
+ * declares, plus the stop reason a foreground call can additionally carry. A
+ * clean foreground run carries only `exitCode`/`stdout`/`stderr`; the
+ * diagnostics a consumer needs to explain an abnormal run are optional and set
+ * only when they say something.
+ */
+type ForegroundValue = {
+  kind: 'foreground'
+  exitCode: number | null
+  stdout: StreamValue
+  stderr: StreamValue
+  signal?: string
+  timedOut?: boolean
+  aborted?: boolean
+  stopped?: string
+  timeoutMs?: number
+  sandbox?: { mode: SandboxMode; denied: boolean; enforcement?: string; runnerFailed?: boolean }
+}
+
 type SpawnValue =
   | { kind: 'background'; jobId: string }
   | { kind: 'promoted'; jobId: string; timeoutMs: number; output: string }
-  | ({ kind: 'foreground' } & ShellRunResult & { stopped?: string })
+  | ForegroundValue
 
 /** The structured render: the value plus the advisory hints, when any. */
 type RenderedSpawn = SpawnValue | (SpawnValue & { hints: string[] })
@@ -278,7 +301,7 @@ function processJob(start: (signal: AbortSignal) => Promise<ShellExecution>, out
 // ── rendering ───────────────────────────────────────────────────────────────
 
 /** Append the truncation notice (with the full-output spill path) to a stream's text. */
-function streamText(output: CollectedOutput): string {
+function streamText(output: StreamValue): string {
   if (!output.truncated) return output.text
   return `${output.text}\n[output truncated; full output: ${output.spillPath ?? '(unavailable)'}]`
 }
@@ -287,7 +310,7 @@ function streamText(output: CollectedOutput): string {
  * The terminal card's human body: stdout, then stderr framed as its own
  * section. Presentation only: the model-facing result is structured JSON.
  */
-function spawnBody(result: ShellRunResult): string {
+function spawnBody(result: { stdout: StreamValue; stderr: StreamValue }): string {
   const out = streamText(result.stdout)
   const err = streamText(result.stderr)
   let body = out
@@ -324,7 +347,7 @@ function spawnHints(value: SpawnValue, escalationModes: readonly string[] = []):
   }
   if (value.timedOut) hints.push(`timed out after ${value.timeoutMs}ms`)
   if (value.stopped !== undefined) hints.push(`stopped: ${value.stopped}`)
-  if (value.signal !== null) hints.push(`killed by signal: ${value.signal}`)
+  if (value.signal !== null && value.signal !== undefined) hints.push(`killed by signal: ${value.signal}`)
   return hints
 }
 
@@ -375,27 +398,28 @@ function toolAborted() {
 }
 
 /** Detach the executor DTO from readonly Service Definition types into plain JSON data. */
-function canonicalRunResult(result: ShellRunResult): ShellRunResult {
-  const output = (stream: CollectedOutput): CollectedOutput => ({
+function canonicalRunResult(result: ShellRunResult): Omit<ForegroundValue, 'kind'> {
+  const output = (stream: CollectedOutput): StreamValue => ({
     text: stream.text,
     truncated: stream.truncated,
     ...(stream.spillPath !== undefined ? { spillPath: stream.spillPath } : {}),
   })
+  const sandbox = result.sandbox
   return {
     exitCode: result.exitCode,
-    signal: result.signal,
-    timedOut: result.timedOut,
-    aborted: result.aborted,
-    timeoutMs: result.timeoutMs,
     stdout: output(result.stdout),
     stderr: output(result.stderr),
-    ...(result.sandbox !== undefined
+    ...(result.signal !== undefined && result.signal !== null ? { signal: result.signal } : {}),
+    ...(result.timedOut ? { timedOut: true } : {}),
+    ...(result.aborted ? { aborted: true } : {}),
+    ...(result.timedOut || result.aborted ? { timeoutMs: result.timeoutMs } : {}),
+    ...(sandbox !== undefined && (sandbox.denied || sandbox.runnerFailed === true)
       ? {
           sandbox: {
-            mode: result.sandbox.mode,
-            denied: result.sandbox.denied,
-            ...(result.sandbox.enforcement !== undefined ? { enforcement: result.sandbox.enforcement } : {}),
-            ...(result.sandbox.runnerFailed !== undefined ? { runnerFailed: result.sandbox.runnerFailed } : {}),
+            mode: sandbox.mode,
+            denied: sandbox.denied,
+            ...(sandbox.enforcement !== undefined ? { enforcement: sandbox.enforcement } : {}),
+            ...(sandbox.runnerFailed !== undefined ? { runnerFailed: sandbox.runnerFailed } : {}),
           },
         }
       : {}),
@@ -410,7 +434,7 @@ const BACKGROUND_OUTPUT_PROPERTIES = {
 } as const
 
 function spawnDescription() {
-  return `Run one program directly — no shell — and return its stdout/stderr: \`command\` is a PATH name or absolute path, \`args\` its argv. Nothing is interpreted by a shell: no globbing, pipes, redirection, or variable expansion; pass the program and its arguments separately, never a command line, and compose pipelines in the program instead. Managed \`${DSH_ENV_PREFIX}*\` variables expose current harness environment facts. \`background: true\` starts a job (collect with \`job_output\`, stop with \`job_kill\`); a foreground call that reaches its timeout is promoted to one. Long output is truncated to its tail and the full path is reported when available. Read the structured result (\`exitCode\`/\`signal\`, \`stdout\`/\`stderr\`, \`sandbox\`); a non-zero exit is a normal result, not a tool error. Programs may run under a file sandbox; a blocked file operation is reported as \`[sandbox: file access denied under <mode> mode]\`, a policy denial: do not retry another way. Before any delete or move, verify the resolved absolute target path.`
+  return `Run one program directly — no shell: \`command\` is a PATH name or absolute path, \`args\` its argv. Nothing is interpreted by a shell, so compose pipelines in the program. Long output is tail-truncated (spill path included); a non-zero exit is a normal result; a sandbox denial marker means do not retry another way. Verify the resolved path before any delete or move.`
 }
 
 function validateSpawnArgs(args: SpawnArgs, effectiveMode: SandboxMode | undefined): void {
@@ -489,7 +513,7 @@ function presentSpawnResult(_args: SpawnArgs, result: ToolResult): ToolResultVie
     return {
       card: 'terminal',
       output: spawnBody(value),
-      ...(value.signal !== null ? { signal: value.signal } : { exitCode: value.exitCode ?? 0 }),
+      ...(value.signal ? { signal: value.signal } : { exitCode: value.exitCode ?? 0 }),
     }
   }
   if (value !== undefined) {
@@ -607,15 +631,10 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
       return {
         kind: 'foreground',
         exitCode: null,
-        signal: null,
         timedOut: true,
-        aborted: false,
         timeoutMs,
         stdout: { text: '', truncated: false },
         stderr: { text: '', truncated: false },
-        ...(spec.sandboxPolicy !== undefined
-          ? { sandbox: { mode: spec.sandboxPolicy.mode, denied: false } }
-          : {}),
       }
     }
     if (view.status === 'running' || view.status === 'stopping') {
@@ -652,49 +671,42 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
       command: {
         type: 'string',
         required: true,
-        description:
-          'The program to run: a PATH name or an absolute path; never a shell command line.'
+        description: 'PATH name or absolute path; never a shell command line.'
       },
       args: {
         type: 'array',
         items: { type: 'string' },
-        description:
-          'Arguments passed verbatim as separate argv entries, in order. Shell metacharacters inside an entry are literal characters.',
+        description: 'argv entries, passed verbatim; shell metacharacters are literal.',
       },
       description: {
         type: 'string',
         required: true,
-        description:
-          'Clear, concise description of what this program does in active voice, 5-10 words (shown in the UI). Examples: ["git","status"] → "Show working tree status"; ["pnpm","test"] → "Run test suite".',
+        description: 'Short active-voice summary of the run, 5-10 words (shown in the UI).',
       },
       timeoutMs: {
         type: 'number',
         description: promote
-          ? 'Timeout in milliseconds. The executor applies its configured default and cap; on expiry the program moves to the background as a job instead of being killed.'
-          : "Timeout in milliseconds. The executor applies its configured default and cap, and kills the program on expiry.",
+          ? 'Timeout in ms; on expiry the run moves to the background as a job.'
+          : 'Timeout in ms; the program is killed on expiry.',
       },
       cwd: {
         type: 'string',
-        description:
-          'Working directory for this program. Defaults to the session workspace; a relative path is resolved against it.',
+        description: 'Working directory; defaults to the session workspace; a relative path resolves against it.',
       },
       stdin: {
         type: 'string',
-        description: "Bytes written to the program's stdin, then closed. Omit to leave stdin empty.",
+        description: "Bytes written to the program's stdin, then closed.",
       },
       env: {
         type: 'json',
         description:
-          'Extra environment variables for this program, as a JSON object of string values. `' +
-          DSH_ENV_PREFIX +
-          '*` names are harness-managed and are rejected; every other entry merges after the credential scrub.',
+          `Extra environment variables as string values; ${DSH_ENV_PREFIX}* names are harness-managed and rejected.`,
       },
       ...(background
         ? {
             background: {
               type: 'boolean',
-              description:
-                'Start the program as a background job and return its job id immediately (collect with job_output, stop with job_kill). No timeout applies.',
+              description: 'Start as a background job and return its job id immediately.',
             },
           }
         : {}),
@@ -707,8 +719,7 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
             },
             justification: {
               type: 'string',
-              description:
-                'Required with sandbox_permissions: one sentence for the user explaining why this exact program needs the wider access. Use the language of the user\u2019s current request.',
+              description: 'Required with sandbox_permissions: why this exact program needs wider access.',
             },
           }
         : {}),
@@ -733,11 +744,6 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
             properties: {
               kind: { type: 'string', required: true, const: 'foreground' },
               exitCode: { required: true, oneOf: [{ type: 'integer' }, { type: 'null' }] },
-              signal: { required: true, oneOf: [{ type: 'string' }, { type: 'null' }] },
-              timedOut: { type: 'boolean', required: true },
-              aborted: { type: 'boolean', required: true },
-              stopped: { type: 'string' },
-              timeoutMs: { type: 'number', required: true },
               stdout: {
                 type: 'object',
                 additionalProperties: false,
@@ -758,6 +764,11 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
                   spillPath: { type: 'string' },
                 },
               },
+              signal: { type: 'string' },
+              timedOut: { type: 'boolean' },
+              aborted: { type: 'boolean' },
+              stopped: { type: 'string' },
+              timeoutMs: { type: 'number' },
               sandbox: {
                 type: 'object',
                 additionalProperties: false,
@@ -857,13 +868,12 @@ async function hostMtime(processPath: string | undefined): Promise<number | unde
 function statTool(ctx: Context): ToolDefinition {
   return defineTool({
     name: 'stat',
-    description:
-      'Return metadata for one path in the session filesystem: whether it exists, whether it is a file or directory, its byte size, and its modification time when the backend can report one. Never reads file contents.',
+    description: 'Return metadata for one path: existence, type, byte size, and mtime when available.',
     parameters: {
       path: {
         type: 'string',
         required: true,
-        description: 'Path to inspect. A relative path resolves against the session workspace.',
+        description: 'Path to inspect; a relative path resolves against the session workspace.',
       },
     },
     output: {
@@ -909,16 +919,16 @@ function statTool(ctx: Context): ToolDefinition {
 function listDirTool(ctx: Context): ToolDefinition {
   return defineTool({
     name: 'list_dir',
-    description: `List the entries of one directory in the session filesystem, one level at a time by default. \`depth\` recurses into subdirectories (maximum ${LIST_DIR_MAX_DEPTH}); results stop at ${LIST_DIR_MAX_ENTRIES} entries and report \`truncated\`. Entries are returned in stable name order and never include file contents.`,
+    description: `List a directory's entries, one level deep by default; \`depth\` recurses up to ${LIST_DIR_MAX_DEPTH} levels. Results stop at ${LIST_DIR_MAX_ENTRIES} entries and report \`truncated\`.`,
     parameters: {
       path: {
         type: 'string',
         required: true,
-        description: 'Directory to list. A relative path resolves against the session workspace.',
+        description: 'Directory to list; a relative path resolves against the session workspace.',
       },
       depth: {
         type: 'integer',
-        description: `How many directory levels to walk: 1 lists direct children only (default), values are clamped to 1..${LIST_DIR_MAX_DEPTH}.`,
+        description: `Directory levels to walk (1..${LIST_DIR_MAX_DEPTH}); defaults to 1.`,
       },
     },
     output: {
@@ -993,10 +1003,10 @@ function listDirTool(ctx: Context): ToolDefinition {
 // ── plugin entry ────────────────────────────────────────────────────────────
 
 /**
- * Register the four tools. `spawn` waits for the optional job registry so its
+ * Register the three tools. `spawn` waits for the optional job registry so its
  * background and promotion paths exist exactly when `job_output`/`job_kill`
- * do; `which` and the two path tools wait for their own capability seams and
- * are simply absent in a composition that lacks them.
+ * do; the two path tools wait for their own capability seams and are simply
+ * absent in a composition that lacks them.
  * @param ctx - the plugin context.
  */
 export function apply(ctx: Context): void {
@@ -1012,7 +1022,7 @@ export function apply(ctx: Context): void {
   ctx.systemPrompt.section({
     name: 'tool:spawn',
     order: ctx.systemPrompt.getSectionOrder('TOOL_BASH'),
-    text: 'Programs run by `spawn` receive an explicit argv and no shell; pass each argument separately and read the returned `exitCode` (or `signal`) on every result. Investigate failures before moving on.',
+    text: 'Programs run by `spawn` take an explicit argv and no shell; read the returned `exitCode` (or `signal`) on every result.',
   })
 
   const options = { escalationModes, resolveSandboxPolicy }
