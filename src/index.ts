@@ -50,14 +50,18 @@ import {
   type CollectedOutput,
   type ShellExecSpec,
   type ShellExecution,
-  type ShellExecutor,
   type ShellRunResult,
   type ShellSandboxInfo,
 } from '@deepseek-ai/dsh-shell'
 import type { JobId, JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
-import type { ShellEnvRegistry } from '@deepseek-ai/dsh-shell-env'
-import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import type { FileSystem } from '@deepseek-ai/dsh-fs'
+import { FiberState, type Context } from '@deepseek-ai/cordis'
+// The empty type-only imports pull in each host package's Cordis `Context`
+// augmentation (`ctx.shellEnv`, `ctx.subprocess`, `ctx.fs`,
+// `ctx.systemPrompt`) without adding any of them to the runtime import graph.
+import type {} from '@deepseek-ai/dsh-shell-env'
+import type {} from '@deepseek-ai/dsh-subprocess'
+import type {} from '@deepseek-ai/dsh-fs'
+import type {} from '@deepseek-ai/dsh-system-prompt'
 
 // ── host packages ────────────────────────────────────────────────────────────
 //
@@ -68,9 +72,6 @@ import type { FileSystem } from '@deepseek-ai/dsh-fs'
 // when the bundle is a symlink.
 
 // ── types ───────────────────────────────────────────────────────────────────
-
-/** The JSON subset every tool value and host DTO here is made of. */
-export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 
 /**
  * The canonical `spawn` value: the discriminated union its output schema
@@ -138,27 +139,6 @@ interface PathArgs {
 interface SpawnToolOptions {
   escalationModes: readonly SandboxMode[]
   resolveSandboxPolicy(spawn: ToolRunContext): SandboxExecutionPolicy | undefined
-}
-
-/**
- * The plugin-context members this plugin touches.
- */
-interface PluginContext {
-  shell: ShellExecutor
-  shellEnv: ShellEnvRegistry
-  get(name: string): any
-  inject(names: string[], apply: (ctx: PluginContext) => void): void
-  logger: { warn(...args: unknown[]): void }
-  systemPrompt: {
-    section(section: { name: string; order: number; text: string }): void
-    getSectionOrder(name: string): number
-  }
-  tools: { register(definition: ToolDefinition): () => void }
-  jobs?: JobRegistry
-  subprocess?: SubprocessRuntime
-  fs?: FileSystem
-  effect(dispose: () => void, name?: string): void
-  fiber: { state: number }
 }
 
 export const name = 'dsh-spawn'
@@ -495,12 +475,15 @@ function resultText(result: ToolResult): string | undefined {
  * their own structure; a failed call renders error text instead and yields
  * undefined, which the generic fallback then shows verbatim.
  */
-function presentedResult(result: ToolResult): any {
+function presentedResult(result: ToolResult): SpawnValue | undefined {
   const raw = resultText(result)
   if (raw === undefined) return undefined
   try {
-    const parsed = JSON.parse(raw)
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : undefined
+    const parsed: unknown = JSON.parse(raw)
+    // The render side only ever emits a `SpawnValue`, and every consumer narrows
+    // on `kind` and falls back to the generic card, so the shape is not
+    // re-validated here. Replay arguments are untrusted, hence the one cast.
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? (parsed as SpawnValue) : undefined
   } catch {
     return undefined
   }
@@ -554,7 +537,7 @@ function resolveWorkdir(modelWorkdir: string | undefined, spawn: ToolRunContext,
  * @param options - resolution facts captured at apply time.
  * @returns the registry-ready tool definition.
  */
-function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: SpawnToolOptions): ToolDefinition {
+function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnToolOptions): ToolDefinition {
   const { escalationModes, resolveSandboxPolicy } = options
   const background = jobs !== undefined
   const promote = background
@@ -708,9 +691,9 @@ function spawnTool(ctx: PluginContext, jobs: JobRegistry | undefined, options: S
       env: {
         type: 'json',
         description:
-          'Extra environment variables for this program, as a JSON object of string values. They merge after the credential scrub, so they cannot displace harness-managed `' +
+          'Extra environment variables for this program, as a JSON object of string values. `' +
           DSH_ENV_PREFIX +
-          '*` facts.',
+          '*` names are harness-managed and are rejected; every other entry merges after the credential scrub.',
       },
       ...(background
         ? {
@@ -877,9 +860,7 @@ async function hostMtime(processPath: string | undefined): Promise<number | unde
   }
 }
 
-function whichTool(ctx: PluginContext): ToolDefinition {
-  const subprocess = ctx.subprocess
-  if (subprocess === undefined) throw new Error('dsh-spawn: which requires ctx.subprocess')
+function whichTool(ctx: Context): ToolDefinition {
   return defineTool({
     name: 'which',
     description:
@@ -918,7 +899,7 @@ function whichTool(ctx: PluginContext): ToolDefinition {
         // Keep the fallback.
       }
       try {
-        return { path: await subprocess.resolveExecutable(args.command, env, spawn.signal) }
+        return { path: await ctx.subprocess.resolveExecutable(args.command, env, spawn.signal) }
       } catch {
         return { path: null }
       }
@@ -926,9 +907,7 @@ function whichTool(ctx: PluginContext): ToolDefinition {
   })
 }
 
-function statTool(ctx: PluginContext): ToolDefinition {
-  const fs = ctx.fs
-  if (fs === undefined) throw new Error('dsh-spawn: stat requires ctx.fs')
+function statTool(ctx: Context): ToolDefinition {
   return defineTool({
     name: 'stat',
     description:
@@ -965,10 +944,10 @@ function statTool(ctx: PluginContext): ToolDefinition {
     isConcurrencySafe: () => true,
     async execute(args: PathArgs, spawn: ToolRunContext) {
       const cwd = sessionCwd(spawn)
-      const target = await fs.resolve(args.path, { ...(cwd !== undefined ? { cwd } : {}), signal: spawn.signal })
-      const info = await fs.stat(target, spawn.signal)
+      const target = await ctx.fs.resolve(args.path, { ...(cwd !== undefined ? { cwd } : {}), signal: spawn.signal })
+      const info = await ctx.fs.stat(target, spawn.signal)
       if (info === undefined) return { path: target.displayPath, exists: false }
-      const mtimeMs = await hostMtime(fs.processPath(target))
+      const mtimeMs = await hostMtime(ctx.fs.processPath(target))
       return {
         path: target.displayPath,
         exists: true,
@@ -980,9 +959,7 @@ function statTool(ctx: PluginContext): ToolDefinition {
   })
 }
 
-function listDirTool(ctx: PluginContext): ToolDefinition {
-  const fs = ctx.fs
-  if (fs === undefined) throw new Error('dsh-spawn: list_dir requires ctx.fs')
+function listDirTool(ctx: Context): ToolDefinition {
   return defineTool({
     name: 'list_dir',
     description: `List the entries of one directory in the session filesystem, one level at a time by default. \`depth\` recurses into subdirectories (maximum ${LIST_DIR_MAX_DEPTH}); results stop at ${LIST_DIR_MAX_ENTRIES} entries and report \`truncated\`. Entries are returned in stable name order and never include file contents.`,
@@ -1034,7 +1011,7 @@ function listDirTool(ctx: PluginContext): ToolDefinition {
     isConcurrencySafe: () => true,
     async execute(args: PathArgs, spawn: ToolRunContext) {
       const cwd = sessionCwd(spawn)
-      const root = await fs.resolve(args.path, { ...(cwd !== undefined ? { cwd } : {}), signal: spawn.signal })
+      const root = await ctx.fs.resolve(args.path, { ...(cwd !== undefined ? { cwd } : {}), signal: spawn.signal })
       const depth = Math.max(1, Math.min(LIST_DIR_MAX_DEPTH, args.depth ?? 1))
       const entries = []
       let truncated = false
@@ -1042,7 +1019,7 @@ function listDirTool(ctx: PluginContext): ToolDefinition {
       while (level.length > 0 && !truncated) {
         const next = []
         for (const item of level) {
-          const children = await fs.listDir(item.target, spawn.signal)
+          const children = await ctx.fs.listDir(item.target, spawn.signal)
           for (const child of children) {
             if (entries.length >= LIST_DIR_MAX_ENTRIES) {
               truncated = true
@@ -1075,7 +1052,7 @@ function listDirTool(ctx: PluginContext): ToolDefinition {
  * are simply absent in a composition that lacks them.
  * @param ctx - the plugin context.
  */
-export function apply(ctx: PluginContext): void {
+export function apply(ctx: Context): void {
   const defaultMode = ctx.shell.sandboxMode
   const escalationModes = defaultMode === undefined ? [] : ESCALATION_TARGETS
   const sandboxPolicy = defaultMode === undefined ? undefined : ctx.get('sandboxPolicy')
@@ -1093,21 +1070,21 @@ export function apply(ctx: PluginContext): void {
 
   const options = { escalationModes, resolveSandboxPolicy }
   let foregroundOnly = ctx.get('jobs') === undefined ? ctx.tools.register(spawnTool(ctx, undefined, options)) : undefined
-  ctx.inject(['jobs'], (jobCtx: PluginContext) => {
+  ctx.inject(['jobs'], (jobCtx: Context) => {
     foregroundOnly?.()
     foregroundOnly = undefined
     const unregister = ctx.tools.register(spawnTool(ctx, jobCtx.jobs, options))
     jobCtx.effect(() => () => {
       unregister()
-      if (ctx.fiber.state === 2) foregroundOnly = ctx.tools.register(spawnTool(ctx, undefined, options))
+      if (ctx.fiber.state === FiberState.ACTIVE) foregroundOnly = ctx.tools.register(spawnTool(ctx, undefined, options))
     })
   })
 
-  ctx.inject(['subprocess'], (subprocessCtx: PluginContext) => {
+  ctx.inject(['subprocess'], (subprocessCtx: Context) => {
     subprocessCtx.tools.register(whichTool(subprocessCtx))
   })
 
-  ctx.inject(['fs'], (fsCtx: PluginContext) => {
+  ctx.inject(['fs'], (fsCtx: Context) => {
     fsCtx.tools.register(statTool(fsCtx))
     fsCtx.tools.register(listDirTool(fsCtx))
   })
