@@ -43,6 +43,7 @@ const DEFAULT_MAX_SPILL_BYTES = 64 * 1024 * 1024
 /** Timeout reason code this runner owns (the executors' `BASH_TIMEOUT` twin). */
 const SPAWN_TIMEOUT = 'SPAWN_TIMEOUT'
 
+
 /** The reader a process that failed before spawn exposes as both streams. */
 const EMPTY_READER: SubprocessOutputReader = {
   readFrom: () => ({ text: '', lossy: false, nextOffset: 0 }),
@@ -81,6 +82,7 @@ function confinedPolicyOf(spec: ShellExecSpec): SandboxPolicy | undefined {
   if (policy === undefined || policy.mode === 'danger-full-access') return undefined
   return { ...policy, mode: policy.mode }
 }
+
 
 /**
  * Spawn one argv vector under this process's sandbox policy and adapt the

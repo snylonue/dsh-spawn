@@ -142,7 +142,10 @@ describe('direct argv execution', () => {
 })
 
 /** Run the registered spawn tool against a fake composition and return the spawn call. */
-async function capturedSpawn(command: string, args: string[]): Promise<Any> {
+async function capturedSpawn(
+  command: string,
+  args: string[],
+): Promise<Any> {
   const mod = await plugin()
   let captured: Any
   const calls: Any = { spawn: [], resolveExecutable: [] }
@@ -160,8 +163,8 @@ async function capturedSpawn(command: string, args: string[]): Promise<Any> {
       }),
     },
     subprocess: {
-      resolveExecutable: async (c: string) => {
-        calls.resolveExecutable.push(c)
+      resolveExecutable: async (c: string, env: Any) => {
+        calls.resolveExecutable.push({ command: c, env })
         return '/resolved/' + c
       },
       spawn: (s: Any) => {

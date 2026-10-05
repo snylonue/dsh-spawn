@@ -548,7 +548,13 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
     )
   }
 
-  const startJob = (registry: JobRegistry, args: SpawnArgs, spawn: ToolRunContext, spec: ShellExecSpec, argv: readonly string[]): AttachedJob => {
+  const startJob = (
+    registry: JobRegistry,
+    args: SpawnArgs,
+    spawn: ToolRunContext,
+    spec: ShellExecSpec,
+    argv: readonly string[],
+  ): AttachedJob => {
     let proc: ShellExecution
     let stopped: string | undefined
     return {
@@ -759,9 +765,15 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
     async execute(args: SpawnArgs, spawn: ToolRunContext): Promise<SpawnValue> {
       const standingPolicy = resolveSandboxPolicy(spawn)
       validateSpawnArgs(args, standingPolicy?.mode)
+      const workdir = resolveWorkdir(args.cwd, spawn, standingPolicy?.workspaceRoot)
+      // Environment providers wrap these subprocess methods transparently.
       // Resolve argv[0] in the execution world before any approval or spawn,
       // so a missing program or a relative path fails here — not inside a job.
-      const executable = await ctx.subprocess.resolveExecutable(args.command, args.env, spawn.signal)
+      const executable = await ctx.subprocess.resolveExecutable(
+        args.command,
+        args.env,
+        spawn.signal,
+      )
       assertDirectlyExecutable(executable)
       const argv = [executable, ...(args.args ?? [])]
       const approvedMode =
@@ -772,7 +784,6 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
         approvedMode === undefined || standingPolicy === undefined
           ? standingPolicy
           : { ...standingPolicy, mode: approvedMode }
-      const workdir = resolveWorkdir(args.cwd, spawn, standingPolicy?.workspaceRoot)
       const dshEnv = ctx.shellEnv.collect(spawn)
       // `ctx.shell.resolve` only fills the budgets and caps (timeout, workdir,
       // stdout cap, policy); the program itself is spawned from `argv`.
