@@ -450,6 +450,11 @@ function validateSpawnArgs(args: SpawnArgs, effectiveMode: SandboxMode | undefin
     }
     for (const [key, value] of Object.entries(args.env)) {
       if (key.length === 0) throw new Error('invalid env: empty variable name')
+      if (key.startsWith(DSH_ENV_PREFIX)) {
+        throw new Error(
+          `invalid env: ${JSON.stringify(key)} is in the harness-managed ${DSH_ENV_PREFIX} namespace and cannot be set`,
+        )
+      }
       if (typeof value !== 'string') throw new Error(`invalid env: value for ${JSON.stringify(key)} must be a string`)
     }
   }
