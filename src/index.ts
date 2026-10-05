@@ -560,7 +560,7 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
         run: () => {
           const hooks = processJob(
             async (signal) => {
-              proc = await runProgram(ctx, spec, argv, signal)
+              proc = await runProgram(ctx, ctx.get('sandbox'), spec, argv, signal)
               return proc
             },
             (started) => processOutcome(started, escalationModes),
@@ -808,7 +808,7 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
         if (attached !== undefined) return waitOnJob(jobs, attached, spawn, spec)
       }
       const spec = ctx.shell.resolve({ ...request, signal: spawn.signal })
-      const result = await (await runProgram(ctx, spec, argv, spawn.signal)).result()
+      const result = await (await runProgram(ctx, ctx.get('sandbox'), spec, argv, spawn.signal)).result()
       if (result.aborted) throw toolAborted()
       return { kind: 'foreground', ...canonicalRunResult(result) }
     },

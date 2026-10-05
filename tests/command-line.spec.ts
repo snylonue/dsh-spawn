@@ -44,9 +44,15 @@ function spec(overrides: Any = {}) {
   }
 }
 
-/** A fake context recording the spawn and confine calls. */
+/** A fake sandbox provider and subprocess context, recording both call streams. */
 function runner(confined?: Any, spawned: Any = handle('out', '', 0)) {
   const calls: Any = { spawn: [], confine: [] }
+  const sandbox = {
+    confine: async (argv: Any, policy: Any, signal: Any) => {
+      calls.confine.push({ argv, policy, signal })
+      return confined ?? { argv: ['runner', ...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
+    },
+  }
   const ctx: Any = {
     subprocess: {
       spawn: (s: Any) => {
@@ -54,14 +60,8 @@ function runner(confined?: Any, spawned: Any = handle('out', '', 0)) {
         return spawned
       },
     },
-    sandbox: {
-      confine: async (argv: Any, policy: Any, signal: Any) => {
-        calls.confine.push({ argv, policy, signal })
-        return confined ?? { argv: ['runner', ...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
-      },
-    },
   }
-  return { ctx, calls }
+  return { ctx, sandbox, calls }
 }
 
 const READ_ONLY = { mode: 'read-only', workspaceRoot: '/ws' }
@@ -69,8 +69,8 @@ const READ_ONLY = { mode: 'read-only', workspaceRoot: '/ws' }
 describe('direct argv execution', () => {
   it('spawns the program argv with no shell layer', async () => {
     const { runProgram } = await directExec()
-    const { ctx, calls } = runner()
-    const proc = await runProgram(ctx, spec(), ['/usr/bin/node', '--version'], undefined)
+    const { ctx, sandbox, calls } = runner()
+    const proc = await runProgram(ctx, sandbox, spec(), ['/usr/bin/node', '--version'], undefined)
     const result = await proc.result()
     expect(calls.confine).toHaveLength(0)
     expect(calls.spawn[0].argv).toEqual(['/usr/bin/node', '--version'])
@@ -86,9 +86,9 @@ describe('direct argv execution', () => {
       denialSignatures: ['Permission denied'],
       runnerFailureRules: [],
     }
-    const { ctx, calls } = runner(confined)
+    const { ctx, sandbox, calls } = runner(confined)
     const result = await (
-      await runProgram(ctx, spec({ sandboxPolicy: { mode: 'workspace-write', workspaceRoot: '/ws' } }), ['/usr/bin/node', '--version'], undefined)
+      await runProgram(ctx, sandbox, spec({ sandboxPolicy: { mode: 'workspace-write', workspaceRoot: '/ws' } }), ['/usr/bin/node', '--version'], undefined)
     ).result()
     expect(calls.confine[0].argv).toEqual(['/usr/bin/node', '--version'])
     expect(calls.spawn[0].argv).toEqual(confined.argv)
@@ -103,8 +103,8 @@ describe('direct argv execution', () => {
       denialSignatures: ['Permission denied'],
       runnerFailureRules: [],
     }
-    const { ctx } = runner(confined, handle('', 'cat: /x: Permission denied', 1))
-    const result = await (await runProgram(ctx, spec({ sandboxPolicy: READ_ONLY }), ['prog'], undefined)).result()
+    const { ctx, sandbox } = runner(confined, handle('', 'cat: /x: Permission denied', 1))
+    const result = await (await runProgram(ctx, sandbox, spec({ sandboxPolicy: READ_ONLY }), ['prog'], undefined)).result()
     expect(result.sandbox).toMatchObject({ mode: 'read-only', denied: true })
   })
 
@@ -116,17 +116,17 @@ describe('direct argv execution', () => {
       denialSignatures: [],
       runnerFailureRules: [{ fatalSignatures: ['runner exploded'] }],
     }
-    const { ctx } = runner(confined, handle('', 'runner exploded', 3))
+    const { ctx, sandbox } = runner(confined, handle('', 'runner exploded', 3))
     await expect(
-      (await runProgram(ctx, spec({ sandboxPolicy: READ_ONLY }), ['prog'], undefined)).result(),
+      (await runProgram(ctx, sandbox, spec({ sandboxPolicy: READ_ONLY }), ['prog'], undefined)).result(),
     ).rejects.toThrow()
   })
 
   it('reports full access without confining', async () => {
     const { runProgram } = await directExec()
-    const { ctx, calls } = runner()
+    const { ctx, sandbox, calls } = runner()
     const result = await (
-      await runProgram(ctx, spec({ sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/ws' } }), ['prog'], undefined)
+      await runProgram(ctx, sandbox, spec({ sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/ws' } }), ['prog'], undefined)
     ).result()
     expect(calls.confine).toHaveLength(0)
     expect(result.sandbox).toEqual({ mode: 'danger-full-access', denied: false })
@@ -186,6 +186,56 @@ async function capturedSpawn(command: string, args: string[]): Promise<Any> {
   return calls.spawn[0]
 }
 
+/** Compose the tool with a confining executor; return the confine + spawn calls. */
+async function capturedConfinedSpawn(command: string, args: string[]): Promise<Any> {
+  const mod = await plugin()
+  let captured: Any
+  const calls: Any = { spawn: [], confine: [] }
+  const spawned = handle('ok', '', 0)
+  const policy = { mode: 'workspace-write', workspaceRoot: '/ws' }
+  const sandbox = {
+    confine: async (argv: Any, p: Any, signal: Any) => {
+      calls.confine.push({ argv, policy: p, signal })
+      return { argv: ['runner', ...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
+    },
+  }
+  const ctx: Any = {
+    shell: {
+      sandboxMode: 'workspace-write',
+      resolve: (request: Any) => ({
+        workdir: '/tmp',
+        timeoutMs: 1000,
+        onExpiry: 'kill',
+        stdoutMaxBytes: 4096,
+        sandboxPolicy: policy,
+        ...request,
+      }),
+    },
+    subprocess: {
+      resolveExecutable: async (c: string) => '/resolved/' + c,
+      spawn: (s: Any) => {
+        calls.spawn.push(s)
+        return spawned
+      },
+    },
+    get: (name: string) =>
+      name === 'sandbox' ? sandbox : name === 'sandboxPolicy' ? { resolve: () => policy } : undefined,
+    logger: { warn: () => {} },
+    systemPrompt: { section: () => {}, getSectionOrder: () => 0 },
+    shellEnv: { collect: () => ({}) },
+    tools: {
+      register: (definition: Any) => {
+        captured = definition
+        return () => {}
+      },
+    },
+    inject: () => {},
+  }
+  mod.apply(ctx)
+  await captured.execute({ command, args, description: 'run a program' }, { signal: new AbortController().signal, callId: 'call-1' })
+  return calls
+}
+
 describe('spawn tool routes argv to the subprocess', () => {
   it('resolves argv[0] and passes every argument verbatim', async () => {
     const args = ['-e', 'process.exit(0); // $HOME $(whoami) | cat', "it's"]
@@ -198,5 +248,11 @@ describe('spawn tool routes argv to the subprocess', () => {
     expect(spawned.argv[0]).toBe('/resolved/node')
     expect(spawned.argv).toHaveLength(2)
     expect(spawned.cwd).toBe('/tmp')
+  })
+
+  it('confines argv through ctx.get("sandbox") when the executor sandboxes', async () => {
+    const calls = await capturedConfinedSpawn('node', ['--version'])
+    expect(calls.confine[0].argv).toEqual(['/resolved/node', '--version'])
+    expect(calls.spawn[0].argv).toEqual(['runner', '/resolved/node', '--version'])
   })
 })
