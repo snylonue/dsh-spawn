@@ -2,7 +2,7 @@
   "name": "dsh-spawn",
   "version": "1.0.0",
   "private": true,
-  "description": "Typed argv process and path API (spawn / which / stat / list_dir) for DeepSeek Harness, mounted by the PTC-spawn agent preset instead of a shell.",
+  "description": "A tool to enable bashless dsh",
   "type": "module",
   "license": "MIT",
   "engines": {
