@@ -1,98 +1,202 @@
 import { describe, expect, it } from 'vitest'
 
-type Dialect = 'posix' | 'powershell'
+type Any = any
 
 /** Import the built plugin and return one exported binding. */
-async function plugin(): Promise<any> {
+async function plugin(): Promise<Any> {
   return import(new URL('../dist/index.js', import.meta.url).href)
 }
 
-/** Build a command line with the plugin's pure builder. */
-async function build(command: string, args: string[] | undefined, dialect: Dialect): Promise<string> {
-  const mod = await plugin()
-  return mod.buildCommandLine(command, args, dialect)
+/** Import the built direct runner. */
+async function directExec(): Promise<Any> {
+  return import(new URL('../dist/direct-exec.js', import.meta.url).href)
 }
 
-/**
- * Run the registered `spawn` tool against a fake executor and return the
- * command line it handed to `ctx.shell.resolve`. This is the wiring the real
- * composition uses: the dialect the builder sees is the platform default.
- */
-async function capturedCommandLine(command: string, args: string[]): Promise<string> {
+/** An offset reader over a fixed string. */
+function reader(text: string) {
+  return { readFrom: (from: number) => ({ text: text.slice(from), nextOffset: text.length, lossy: false }) }
+}
+
+/** A provider handle exposing the collect readers the runner asks for. */
+function handle(stdout: string, stderr: string, exitCode: number, signal: string | null = null) {
+  return {
+    stdin: undefined,
+    stdout: undefined,
+    stderr: undefined,
+    control: undefined,
+    collected: { stdout: reader(stdout), stderr: reader(stderr) },
+    done: Promise.resolve({ exitCode, signal }),
+    terminate: () => {},
+    waitForExit: async () => true,
+  }
+}
+
+/** One resolved spec the runner consumes. */
+function spec(overrides: Any = {}) {
+  return {
+    command: 'prog',
+    workdir: '/tmp',
+    timeoutMs: 60000,
+    onExpiry: 'none',
+    stdoutMaxBytes: 65536,
+    sandboxPolicy: undefined,
+    ...overrides,
+  }
+}
+
+/** A fake context recording the spawn and confine calls. */
+function runner(confined?: Any, spawned: Any = handle('out', '', 0)) {
+  const calls: Any = { spawn: [], confine: [] }
+  const ctx: Any = {
+    subprocess: {
+      spawn: (s: Any) => {
+        calls.spawn.push(s)
+        return spawned
+      },
+    },
+    sandbox: {
+      confine: async (argv: Any, policy: Any, signal: Any) => {
+        calls.confine.push({ argv, policy, signal })
+        return confined ?? { argv: ['runner', ...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
+      },
+    },
+  }
+  return { ctx, calls }
+}
+
+const READ_ONLY = { mode: 'read-only', workspaceRoot: '/ws' }
+
+describe('direct argv execution', () => {
+  it('spawns the program argv with no shell layer', async () => {
+    const { runProgram } = await directExec()
+    const { ctx, calls } = runner()
+    const proc = await runProgram(ctx, spec(), ['/usr/bin/node', '--version'], undefined)
+    const result = await proc.result()
+    expect(calls.confine).toHaveLength(0)
+    expect(calls.spawn[0].argv).toEqual(['/usr/bin/node', '--version'])
+    expect(result).toMatchObject({ exitCode: 0, stdout: { text: 'out' }, stderr: { text: '' } })
+    expect(result.sandbox).toBeUndefined()
+  })
+
+  it('confines the exact argv and reports the sandbox facts', async () => {
+    const { runProgram } = await directExec()
+    const confined = {
+      argv: ['sandbox-runner', '/usr/bin/node', '--version'],
+      enforcement: 'partial',
+      denialSignatures: ['Permission denied'],
+      runnerFailureRules: [],
+    }
+    const { ctx, calls } = runner(confined)
+    const result = await (
+      await runProgram(ctx, spec({ sandboxPolicy: { mode: 'workspace-write', workspaceRoot: '/ws' } }), ['/usr/bin/node', '--version'], undefined)
+    ).result()
+    expect(calls.confine[0].argv).toEqual(['/usr/bin/node', '--version'])
+    expect(calls.spawn[0].argv).toEqual(confined.argv)
+    expect(result.sandbox).toEqual({ mode: 'workspace-write', denied: false, enforcement: 'partial' })
+  })
+
+  it('marks a matching non-zero exit as a sandbox denial', async () => {
+    const { runProgram } = await directExec()
+    const confined = {
+      argv: ['sandbox-runner', 'prog'],
+      enforcement: 'full',
+      denialSignatures: ['Permission denied'],
+      runnerFailureRules: [],
+    }
+    const { ctx } = runner(confined, handle('', 'cat: /x: Permission denied', 1))
+    const result = await (await runProgram(ctx, spec({ sandboxPolicy: READ_ONLY }), ['prog'], undefined)).result()
+    expect(result.sandbox).toMatchObject({ mode: 'read-only', denied: true })
+  })
+
+  it('reports a runner failure as sandbox-unavailable', async () => {
+    const { runProgram } = await directExec()
+    const confined = {
+      argv: ['sandbox-runner', 'prog'],
+      enforcement: 'full',
+      denialSignatures: [],
+      runnerFailureRules: [{ fatalSignatures: ['runner exploded'] }],
+    }
+    const { ctx } = runner(confined, handle('', 'runner exploded', 3))
+    await expect(
+      (await runProgram(ctx, spec({ sandboxPolicy: READ_ONLY }), ['prog'], undefined)).result(),
+    ).rejects.toThrow()
+  })
+
+  it('reports full access without confining', async () => {
+    const { runProgram } = await directExec()
+    const { ctx, calls } = runner()
+    const result = await (
+      await runProgram(ctx, spec({ sandboxPolicy: { mode: 'danger-full-access', workspaceRoot: '/ws' } }), ['prog'], undefined)
+    ).result()
+    expect(calls.confine).toHaveLength(0)
+    expect(result.sandbox).toEqual({ mode: 'danger-full-access', denied: false })
+  })
+
+  it('rejects a Windows batch-file target with an actionable error', async () => {
+    const { assertDirectlyExecutable } = await directExec()
+    expect(() => assertDirectlyExecutable('C:\\Users\\me\\npm.cmd', 'win32')).toThrow(/batch file/)
+    expect(() => assertDirectlyExecutable('C:\\tools\\run.BAT', 'win32')).toThrow(/batch file/)
+    expect(() => assertDirectlyExecutable('C:\\nodejs\\node.exe', 'win32')).not.toThrow()
+    expect(() => assertDirectlyExecutable('/usr/bin/npm.cmd', 'linux')).not.toThrow()
+  })
+})
+
+/** Run the registered spawn tool against a fake composition and return the spawn call. */
+async function capturedSpawn(command: string, args: string[]): Promise<Any> {
   const mod = await plugin()
-  let captured: any
-  let spec: any
-  const ctx: any = {
+  let captured: Any
+  const calls: Any = { spawn: [], resolveExecutable: [] }
+  const spawned = handle('ok', '', 0)
+  const ctx: Any = {
     shell: {
       sandboxMode: undefined,
-      resolve: (request: any) => ({
+      resolve: (request: Any) => ({
         workdir: '/tmp',
         timeoutMs: 1000,
         onExpiry: 'kill',
-        stdoutMaxBytes: 1,
+        stdoutMaxBytes: 4096,
         sandboxPolicy: undefined,
         ...request,
       }),
-      execute: async (resolved: any) => {
-        spec = resolved
-        return {
-          result: async () => ({
-            exitCode: 0,
-            signal: null,
-            timedOut: false,
-            aborted: false,
-            timeoutMs: 1000,
-            stdout: { text: '', truncated: false },
-            stderr: { text: '', truncated: false },
-          }),
-        }
+    },
+    subprocess: {
+      resolveExecutable: async (c: string) => {
+        calls.resolveExecutable.push(c)
+        return '/resolved/' + c
+      },
+      spawn: (s: Any) => {
+        calls.spawn.push(s)
+        return spawned
       },
     },
     get: () => undefined,
     logger: { warn: () => {} },
     systemPrompt: { section: () => {}, getSectionOrder: () => 0 },
     shellEnv: { collect: () => ({}) },
-    tools: { register: (definition: any) => { captured = definition; return () => {} } },
+    tools: {
+      register: (definition: Any) => {
+        captured = definition
+        return () => {}
+      },
+    },
     inject: () => {},
   }
   mod.apply(ctx)
-  const spawn = { signal: new AbortController().signal, callId: 'call-1' }
-  await captured.execute({ command, args, description: 'run a program' }, spawn)
-  return spec.command
+  await captured.execute({ command, args, description: 'run a program' }, { signal: new AbortController().signal, callId: 'call-1' })
+  return calls.spawn[0]
 }
 
-describe('spawn command line', () => {
-  it('quotes every word as a POSIX literal', async () => {
-    expect(await build('node', ['--version'], 'posix')).toBe("'node' '--version'")
-    expect(await build('echo', ['a b', ''], 'posix')).toBe("'echo' 'a b' ''")
-    expect(await build('node', ["it's"], 'posix')).toBe("'node' 'it'\\''s'")
+describe('spawn tool routes argv to the subprocess', () => {
+  it('resolves argv[0] and passes every argument verbatim', async () => {
+    const args = ['-e', 'process.exit(0); // $HOME $(whoami) | cat', "it's"]
+    const spawned = await capturedSpawn('node', args)
+    expect(spawned.argv).toEqual(['/resolved/node', ...args])
   })
 
-  it('invokes a PowerShell command through the call operator', async () => {
-    expect(await build('node', ['--version'], 'powershell')).toBe("& 'node' '--version'")
-    expect(await build('whoami', undefined, 'powershell')).toBe("& 'whoami'")
-    expect(await build('echo', ['a b', ''], 'powershell')).toBe("& 'echo' 'a b' ''")
-    expect(await build('node', ["it's"], 'powershell')).toBe("& 'node' 'it''s'")
-  })
-
-  it('accepts native Windows program paths', async () => {
-    const node = 'C:\\Users\\me\\AppData\\Roaming\\nvm\\v20.11.0\\node.exe'
-    expect(await build(node, ['--version'], 'powershell')).toBe(`& '${node}' '--version'`)
-    expect(await build('C:\\Program Files\\nodejs\\node.exe', undefined, 'powershell')).toBe(
-      "& 'C:\\Program Files\\nodejs\\node.exe'",
-    )
-    expect(await build('C:/Users/me/node.exe', undefined, 'posix')).toBe("'C:/Users/me/node.exe'")
-  })
-
-  it('rejects a shell command line instead of a program', async () => {
-    await expect(build('node; rm -rf /', [], 'posix')).rejects.toThrow(/invalid command/)
-    await expect(build('$(whoami)', [], 'powershell')).rejects.toThrow(/invalid command/)
-    await expect(build('a|b', [], 'posix')).rejects.toThrow(/invalid command/)
-    await expect(build('', [], 'posix')).rejects.toThrow(/invalid command/)
-  })
-
-  it('runs the built line through the mounted executor', async () => {
-    // On this POSIX test host the composition default is the POSIX dialect.
-    expect(await capturedCommandLine('node', ['--version'])).toBe("'node' '--version'")
+  it('spawns the resolved executable directly, with no shell wrapper', async () => {
+    const spawned = await capturedSpawn('node', ['--version'])
+    expect(spawned.argv[0]).toBe('/resolved/node')
+    expect(spawned.argv).toHaveLength(2)
+    expect(spawned.cwd).toBe('/tmp')
   })
 })

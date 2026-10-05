@@ -5,9 +5,10 @@
  * Three model-facing tools, all callable inside a `run_code` program as
  * `tools.<name>(...)`:
  *
- * - `spawn`      run one program by argv (never a shell string), confined by the
- *               mounted shell executor's sandbox policy and escalatable through
- *               the shared approval choreography.
+ * - `spawn`      run one program by argv (never a shell string), spawned
+ *               directly through `ctx.subprocess` under the composition's sandbox
+ *               policy (see `./direct-exec.js`) and escalatable through the
+ *               shared approval choreography.
  * - `stat`      sandbox-aware metadata for one path.
  * - `list_dir`  bounded, depth-limited directory listing.
  *
@@ -54,20 +55,22 @@ import {
 } from '@deepseek-ai/dsh-shell'
 import type { JobId, JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
 import { FiberState, type Context } from '@deepseek-ai/cordis'
+import { assertDirectlyExecutable, runProgram } from './direct-exec.js'
 // The empty type-only imports pull in each host package's Cordis `Context`
-// augmentation (`ctx.shellEnv`, `ctx.fs`, `ctx.systemPrompt`) without
-// adding any of them to the runtime import graph.
+// augmentation (`ctx.subprocess`, `ctx.shellEnv`, `ctx.fs`,
+// `ctx.systemPrompt`) without adding any of them to the runtime import graph.
+import type {} from '@deepseek-ai/dsh-subprocess'
 import type {} from '@deepseek-ai/dsh-shell-env'
 import type {} from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 
 // ── host packages ────────────────────────────────────────────────────────────
 //
-// `@deepseek-ai/dsh-tools` / `dsh-llm` / `dsh-sandbox` / `dsh-shell` are
-// peer dependencies: the dsh launcher installs a runtime resolution into
-// Node's ESM and CommonJS resolvers, and this package's peer declarations route
-// each bare request to the module instance the running harness loaded, even
-// when the bundle is a symlink.
+// `@deepseek-ai/dsh-tools` / `dsh-llm` / `dsh-sandbox` / `dsh-shell` /
+// `dsh-subprocess` / `dsh-timeout` are peer dependencies: the dsh launcher
+// installs a runtime resolution into Node's ESM and CommonJS resolvers, and
+// this package's peer declarations route each bare request to the module
+// instance the running harness loaded, even when the bundle is a symlink.
 
 // ── types ───────────────────────────────────────────────────────────────────
 
@@ -156,92 +159,15 @@ interface PathArgs {
 interface SpawnToolOptions {
   escalationModes: readonly SandboxMode[]
   resolveSandboxPolicy(spawn: ToolRunContext): SandboxExecutionPolicy | undefined
-  shellDialect: ShellDialect
 }
 
 export const name = 'dsh-spawn'
-export const inject = ['tools', 'shell', 'systemPrompt', 'shellEnv']
+export const inject = ['tools', 'shell', 'subprocess', 'systemPrompt', 'shellEnv']
 
 /** Upper bound on one `list_dir` result, so a deep listing never floods the program. */
 const LIST_DIR_MAX_ENTRIES = 2000
 /** Upper bound on `list_dir` recursion; depth is clamped into [1, 3]. */
 const LIST_DIR_MAX_DEPTH = 3
-/**
- * The shell dialect the mounted executor parses its command text with. POSIX
- * covers the bash executor used everywhere but Windows; PowerShell covers the
- * pwsh executor a Windows composition mounts.
- */
-export type ShellDialect = 'posix' | 'powershell'
-
-/**
- * The dialect a composition that does not say otherwise runs: DSH mounts the
- * PowerShell executor on Windows and the bash executor elsewhere, so the host
- * platform decides.
- * @returns the mounted executor's dialect for this process.
- */
-function defaultShellDialect(): ShellDialect {
-  return process.platform === 'win32' ? 'powershell' : 'posix'
-}
-
-/**
- * A program name or absolute path. Backslashes and spaces are allowed because
- * native Windows paths use both (`C:\\Program Files\\nodejs\\node.exe`) and the
- * builder quotes the whole command as one word; the excluded characters are
- * the ones that would turn the argument into a shell command line.
- */
-const PROGRAM_NAME = /^[A-Za-z0-9_./\\:@+ -]+$/
-
-// ── argv → one quoted command line ──────────────────────────────────────────
-
-/**
- * Quote one argv entry for a POSIX shell: single-quote the whole word, so
- * `$`, globs, backticks, `;`, spaces and newlines inside it stay literal, and
- * an embedded single quote becomes the standard `'\''` escape.
- * @param value - the exact argv entry the program must receive.
- * @returns the entry as one literal shell word.
- */
-function posixQuote(value: string): string {
-  if (value.length === 0) return "''"
-  return `'${value.replaceAll("'", "'\\''")}'`
-}
-
-/**
- * Quote one argv entry for PowerShell: single-quote the whole word, so `$` and
- * `$(...)` inside it stay literal, and an embedded single quote doubles.
- * @param value - the exact argv entry the program must receive.
- * @returns the entry as one literal PowerShell string expression.
- */
-function powershellQuote(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`
-}
-
-/**
- * Build the single shell command line the executor runs from a program name
- * and an argv array. Every word is quoted, so nothing is interpreted; the
- * program name itself is validated first because quoting cannot make a
- * nonsense program name meaningful.
- *
- * The dialect is the mounted executor's: a POSIX shell runs the first quoted
- * word as the command, while PowerShell parses a leading quoted word as a
- * string expression and echoes it — the call operator (`&`) makes it invoke
- * the program instead. A POSIX-style `'prog' 'arg'` line handed to
- * `pwsh -Command` is a parse error, not a run.
- * @param command - bare PATH name or absolute path.
- * @param args - arguments passed verbatim as separate argv entries.
- * @param dialect - the mounted executor's shell dialect.
- * @returns one command line whose every word is a literal.
- */
-export function buildCommandLine(command: string, args: string[] | undefined, dialect: ShellDialect): string {
-  if (typeof command !== 'string' || command.length === 0 || !PROGRAM_NAME.test(command)) {
-    throw new Error(
-      `invalid command: expected a program name or absolute path without shell metacharacters, got ${JSON.stringify(command)}`,
-    )
-  }
-  const words = [command, ...(args ?? [])]
-  return dialect === 'powershell'
-    ? `& ${words.map(powershellQuote).join(' ')}`
-    : words.map(posixQuote).join(' ')
-}
 
 /** Display form for cards; never executed, so no validation is needed. */
 function displayCommand(command: string, args: string[] | undefined): string {
@@ -599,7 +525,7 @@ function resolveWorkdir(modelWorkdir: string | undefined, spawn: ToolRunContext,
  * @returns the registry-ready tool definition.
  */
 function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnToolOptions): ToolDefinition {
-  const { escalationModes, resolveSandboxPolicy, shellDialect } = options
+  const { escalationModes, resolveSandboxPolicy } = options
   const background = jobs !== undefined
   const promote = background
 
@@ -622,7 +548,7 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
     )
   }
 
-  const startJob = (registry: JobRegistry, args: SpawnArgs, spawn: ToolRunContext, spec: ShellExecSpec): AttachedJob => {
+  const startJob = (registry: JobRegistry, args: SpawnArgs, spawn: ToolRunContext, spec: ShellExecSpec, argv: readonly string[]): AttachedJob => {
     let proc: ShellExecution
     let stopped: string | undefined
     return {
@@ -634,7 +560,7 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
         run: () => {
           const hooks = processJob(
             async (signal) => {
-              proc = await ctx.shell.execute({ ...spec, signal })
+              proc = await runProgram(ctx, spec, argv, signal)
               return proc
             },
             (started) => processOutcome(started, escalationModes),
@@ -832,8 +758,12 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
     },
     async execute(args: SpawnArgs, spawn: ToolRunContext): Promise<SpawnValue> {
       const standingPolicy = resolveSandboxPolicy(spawn)
-      const commandLine = buildCommandLine(args.command, args.args, shellDialect)
       validateSpawnArgs(args, standingPolicy?.mode)
+      // Resolve argv[0] in the execution world before any approval or spawn,
+      // so a missing program or a relative path fails here — not inside a job.
+      const executable = await ctx.subprocess.resolveExecutable(args.command, args.env, spawn.signal)
+      assertDirectlyExecutable(executable)
+      const argv = [executable, ...(args.args ?? [])]
       const approvedMode =
         args.sandbox_permissions !== undefined && args.justification !== undefined
           ? await approveSpawnEscalation(args.sandbox_permissions, args.justification, spawn, standingPolicy)
@@ -844,8 +774,10 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
           : { ...standingPolicy, mode: approvedMode }
       const workdir = resolveWorkdir(args.cwd, spawn, standingPolicy?.workspaceRoot)
       const dshEnv = ctx.shellEnv.collect(spawn)
+      // `ctx.shell.resolve` only fills the budgets and caps (timeout, workdir,
+      // stdout cap, policy); the program itself is spawned from `argv`.
       const request = {
-        command: commandLine,
+        command: args.command,
         ...(workdir !== undefined ? { workdir } : {}),
         ...(args.timeoutMs !== undefined ? { timeoutMs: args.timeoutMs } : {}),
         ...(args.stdin !== undefined ? { stdin: args.stdin } : {}),
@@ -860,14 +792,14 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
         if (spawn.signal.aborted) throw toolAborted()
         return {
           kind: 'background',
-          jobId: startJob(jobs, args, spawn, ctx.shell.resolve({ ...request, onExpiry: 'none' })).id,
+          jobId: startJob(jobs, args, spawn, ctx.shell.resolve({ ...request, onExpiry: 'none' }), argv).id,
         }
       }
       if (jobs !== undefined && promote) {
         const spec = ctx.shell.resolve({ ...request, onExpiry: 'none' })
         let attached
         try {
-          attached = startJob(jobs, args, spawn, spec)
+          attached = startJob(jobs, args, spawn, spec, argv)
         } catch (error) {
           ctx.logger.warn(
             `dsh-spawn: job registration refused, running in the foreground with the timeout kill instead: ${String(error)}`,
@@ -875,9 +807,8 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
         }
         if (attached !== undefined) return waitOnJob(jobs, attached, spawn, spec)
       }
-      const result = await (
-        await ctx.shell.execute(ctx.shell.resolve({ ...request, signal: spawn.signal }))
-      ).result()
+      const spec = ctx.shell.resolve({ ...request, signal: spawn.signal })
+      const result = await (await runProgram(ctx, spec, argv, spawn.signal)).result()
       if (result.aborted) throw toolAborted()
       return { kind: 'foreground', ...canonicalRunResult(result) }
     },
@@ -1068,7 +999,7 @@ export function apply(ctx: Context): void {
     text: 'Programs run by `spawn` take an explicit argv and no shell; read the returned `exitCode` (or `signal`) on every result.',
   })
 
-  const options = { escalationModes, resolveSandboxPolicy, shellDialect: defaultShellDialect() }
+  const options = { escalationModes, resolveSandboxPolicy }
   let foregroundOnly = ctx.get('jobs') === undefined ? ctx.tools.register(spawnTool(ctx, undefined, options)) : undefined
   ctx.inject(['jobs'], (jobCtx: Context) => {
     foregroundOnly?.()
