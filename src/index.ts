@@ -156,6 +156,7 @@ interface PathArgs {
 interface SpawnToolOptions {
   escalationModes: readonly SandboxMode[]
   resolveSandboxPolicy(spawn: ToolRunContext): SandboxExecutionPolicy | undefined
+  shellDialect: ShellDialect
 }
 
 export const name = 'dsh-spawn'
@@ -165,8 +166,30 @@ export const inject = ['tools', 'shell', 'systemPrompt', 'shellEnv']
 const LIST_DIR_MAX_ENTRIES = 2000
 /** Upper bound on `list_dir` recursion; depth is clamped into [1, 3]. */
 const LIST_DIR_MAX_DEPTH = 3
-/** A program name or absolute path, with no shell metacharacters to be quoted away. */
-const PROGRAM_NAME = /^[A-Za-z0-9_./:@+-]+$/
+/**
+ * The shell dialect the mounted executor parses its command text with. POSIX
+ * covers the bash executor used everywhere but Windows; PowerShell covers the
+ * pwsh executor a Windows composition mounts.
+ */
+export type ShellDialect = 'posix' | 'powershell'
+
+/**
+ * The dialect a composition that does not say otherwise runs: DSH mounts the
+ * PowerShell executor on Windows and the bash executor elsewhere, so the host
+ * platform decides.
+ * @returns the mounted executor's dialect for this process.
+ */
+function defaultShellDialect(): ShellDialect {
+  return process.platform === 'win32' ? 'powershell' : 'posix'
+}
+
+/**
+ * A program name or absolute path. Backslashes and spaces are allowed because
+ * native Windows paths use both (`C:\\Program Files\\nodejs\\node.exe`) and the
+ * builder quotes the whole command as one word; the excluded characters are
+ * the ones that would turn the argument into a shell command line.
+ */
+const PROGRAM_NAME = /^[A-Za-z0-9_./\\:@+ -]+$/
 
 // ── argv → one quoted command line ──────────────────────────────────────────
 
@@ -177,9 +200,19 @@ const PROGRAM_NAME = /^[A-Za-z0-9_./:@+-]+$/
  * @param value - the exact argv entry the program must receive.
  * @returns the entry as one literal shell word.
  */
-function shellQuote(value: string): string {
+function posixQuote(value: string): string {
   if (value.length === 0) return "''"
   return `'${value.replaceAll("'", "'\\''")}'`
+}
+
+/**
+ * Quote one argv entry for PowerShell: single-quote the whole word, so `$` and
+ * `$(...)` inside it stay literal, and an embedded single quote doubles.
+ * @param value - the exact argv entry the program must receive.
+ * @returns the entry as one literal PowerShell string expression.
+ */
+function powershellQuote(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`
 }
 
 /**
@@ -187,17 +220,27 @@ function shellQuote(value: string): string {
  * and an argv array. Every word is quoted, so nothing is interpreted; the
  * program name itself is validated first because quoting cannot make a
  * nonsense program name meaningful.
+ *
+ * The dialect is the mounted executor's: a POSIX shell runs the first quoted
+ * word as the command, while PowerShell parses a leading quoted word as a
+ * string expression and echoes it — the call operator (`&`) makes it invoke
+ * the program instead. A POSIX-style `'prog' 'arg'` line handed to
+ * `pwsh -Command` is a parse error, not a run.
  * @param command - bare PATH name or absolute path.
  * @param args - arguments passed verbatim as separate argv entries.
+ * @param dialect - the mounted executor's shell dialect.
  * @returns one command line whose every word is a literal.
  */
-function buildCommandLine(command: string, args: string[] | undefined): string {
+export function buildCommandLine(command: string, args: string[] | undefined, dialect: ShellDialect): string {
   if (typeof command !== 'string' || command.length === 0 || !PROGRAM_NAME.test(command)) {
     throw new Error(
       `invalid command: expected a program name or absolute path without shell metacharacters, got ${JSON.stringify(command)}`,
     )
   }
-  return [command, ...(args ?? [])].map(shellQuote).join(' ')
+  const words = [command, ...(args ?? [])]
+  return dialect === 'powershell'
+    ? `& ${words.map(powershellQuote).join(' ')}`
+    : words.map(posixQuote).join(' ')
 }
 
 /** Display form for cards; never executed, so no validation is needed. */
@@ -556,7 +599,7 @@ function resolveWorkdir(modelWorkdir: string | undefined, spawn: ToolRunContext,
  * @returns the registry-ready tool definition.
  */
 function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnToolOptions): ToolDefinition {
-  const { escalationModes, resolveSandboxPolicy } = options
+  const { escalationModes, resolveSandboxPolicy, shellDialect } = options
   const background = jobs !== undefined
   const promote = background
 
@@ -789,7 +832,7 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
     },
     async execute(args: SpawnArgs, spawn: ToolRunContext): Promise<SpawnValue> {
       const standingPolicy = resolveSandboxPolicy(spawn)
-      const commandLine = buildCommandLine(args.command, args.args)
+      const commandLine = buildCommandLine(args.command, args.args, shellDialect)
       validateSpawnArgs(args, standingPolicy?.mode)
       const approvedMode =
         args.sandbox_permissions !== undefined && args.justification !== undefined
@@ -1025,7 +1068,7 @@ export function apply(ctx: Context): void {
     text: 'Programs run by `spawn` take an explicit argv and no shell; read the returned `exitCode` (or `signal`) on every result.',
   })
 
-  const options = { escalationModes, resolveSandboxPolicy }
+  const options = { escalationModes, resolveSandboxPolicy, shellDialect: defaultShellDialect() }
   let foregroundOnly = ctx.get('jobs') === undefined ? ctx.tools.register(spawnTool(ctx, undefined, options)) : undefined
   ctx.inject(['jobs'], (jobCtx: Context) => {
     foregroundOnly?.()
