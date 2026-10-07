@@ -145,11 +145,11 @@ describe('direct argv execution', () => {
 async function capturedSpawn(
   command: string,
   args: string[],
+  spawned: Any = handle('ok', '', 0),
 ): Promise<Any> {
   const mod = await plugin()
   let captured: Any
   const calls: Any = { spawn: [], resolveExecutable: [] }
-  const spawned = handle('ok', '', 0)
   const ctx: Any = {
     shell: {
       sandboxMode: undefined,
@@ -185,8 +185,9 @@ async function capturedSpawn(
     inject: () => {},
   }
   mod.apply(ctx)
-  await captured.execute({ command, args, description: 'run a program' }, { signal: new AbortController().signal, callId: 'call-1' })
-  return calls.spawn[0]
+  const input = { command, args, description: 'run a program' }
+  const result = await captured.execute(input, { signal: new AbortController().signal, callId: 'call-1' })
+  return { ...calls.spawn[0], result, rendered: JSON.parse(captured.output.render(input, result)[0].text) }
 }
 
 /** Compose the tool with a confining executor; return the confine + spawn calls. */
@@ -238,6 +239,36 @@ async function capturedConfinedSpawn(command: string, args: string[]): Promise<A
   await captured.execute({ command, args, description: 'run a program' }, { signal: new AbortController().signal, callId: 'call-1' })
   return calls
 }
+
+describe('spawn compact results', () => {
+  it.each([
+    ['', '', 0],
+    ['ok', '', 0],
+    ['ok', 'bad', 3],
+    ['', ' \n', 0],
+  ])('omits false truncation and empty stderr (%j, %j, %j)', async (stdout, stderr, exitCode) => {
+    const { result, rendered } = await capturedSpawn('node', [], handle(stdout, stderr, exitCode))
+    const expected = {
+      kind: 'foreground', exitCode, stdout: { text: stdout },
+      ...(stderr.length > 0 ? { stderr: { text: stderr } } : {}),
+    }
+    expect(result).toEqual(expected)
+    expect(rendered).toEqual(expected)
+  })
+
+  it('retains truncation and spill facts even with empty captured stderr', async () => {
+    const spawned = handle('tail', '', 0)
+    spawned.collected.stdout.readFrom = () => ({ text: 'tail', nextOffset: 100, lossy: true, spillPath: '/tmp/out-spill' })
+    spawned.collected.stderr.readFrom = () => ({ text: '', nextOffset: 100, lossy: true, spillPath: '/tmp/err-spill' })
+    const { result, rendered } = await capturedSpawn('node', [], spawned)
+    expect(result).toEqual({
+      kind: 'foreground', exitCode: 0,
+      stdout: { text: 'tail', truncated: true, spillPath: '/tmp/out-spill' },
+      stderr: { text: '', truncated: true, spillPath: '/tmp/err-spill' },
+    })
+    expect(rendered).toEqual(result)
+  })
+})
 
 describe('spawn tool routes argv to the subprocess', () => {
   it('resolves argv[0] and passes every argument verbatim', async () => {

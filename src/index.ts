@@ -79,12 +79,12 @@ import type {} from '@deepseek-ai/dsh-system-prompt'
  * declares, plus the stop reason a foreground call can additionally carry.
  */
 /** One captured stream's model-facing value. */
-type StreamValue = { text: string; truncated: boolean; spillPath?: string }
+type StreamValue = { text: string; truncated?: true; spillPath?: string }
 
 /**
  * The canonical `spawn` value: the discriminated union its output schema
  * declares, plus the stop reason a foreground call can additionally carry. A
- * clean foreground run carries only `exitCode`/`stdout`/`stderr`; the
+ * clean foreground run carries only `exitCode`/`stdout` (and nonempty `stderr`); the
  * diagnostics a consumer needs to explain an abnormal run are optional and set
  * only when they say something.
  */
@@ -92,7 +92,7 @@ type ForegroundValue = {
   kind: 'foreground'
   exitCode: number | null
   stdout: StreamValue
-  stderr: StreamValue
+  stderr?: StreamValue
   signal?: string
   timedOut?: boolean
   aborted?: boolean
@@ -279,9 +279,9 @@ function streamText(output: StreamValue): string {
  * The terminal card's human body: stdout, then stderr framed as its own
  * section. Presentation only: the model-facing result is structured JSON.
  */
-function spawnBody(result: { stdout: StreamValue; stderr: StreamValue }): string {
+function spawnBody(result: { stdout: StreamValue; stderr?: StreamValue }): string {
   const out = streamText(result.stdout)
-  const err = streamText(result.stderr)
+  const err = result.stderr === undefined ? '' : streamText(result.stderr)
   let body = out
   if (err.length > 0) {
     if (body.length > 0 && !body.endsWith('\n')) body += '\n'
@@ -370,14 +370,16 @@ function toolAborted() {
 function canonicalRunResult(result: ShellRunResult): Omit<ForegroundValue, 'kind'> {
   const output = (stream: CollectedOutput): StreamValue => ({
     text: stream.text,
-    truncated: stream.truncated,
+    ...(stream.truncated ? { truncated: true as const } : {}),
     ...(stream.spillPath !== undefined ? { spillPath: stream.spillPath } : {}),
   })
   const sandbox = result.sandbox
   return {
     exitCode: result.exitCode,
     stdout: output(result.stdout),
-    stderr: output(result.stderr),
+    ...(result.stderr.text.length > 0 || result.stderr.truncated || result.stderr.spillPath !== undefined
+      ? { stderr: output(result.stderr) }
+      : {}),
     ...(result.signal !== undefined && result.signal !== null ? { signal: result.signal } : {}),
     ...(result.timedOut ? { timedOut: true } : {}),
     ...(result.aborted ? { aborted: true } : {}),
@@ -608,8 +610,7 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
         exitCode: null,
         timedOut: true,
         timeoutMs,
-        stdout: { text: '', truncated: false },
-        stderr: { text: '', truncated: false },
+        stdout: { text: '' },
       }
     }
     if (view.status === 'running' || view.status === 'stopping') {
@@ -725,17 +726,16 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
                 required: true,
                 properties: {
                   text: { type: 'string', required: true },
-                  truncated: { type: 'boolean', required: true },
+                  truncated: { type: 'boolean', const: true },
                   spillPath: { type: 'string' },
                 },
               },
               stderr: {
                 type: 'object',
                 additionalProperties: false,
-                required: true,
                 properties: {
                   text: { type: 'string', required: true },
-                  truncated: { type: 'boolean', required: true },
+                  truncated: { type: 'boolean', const: true },
                   spillPath: { type: 'string' },
                 },
               },

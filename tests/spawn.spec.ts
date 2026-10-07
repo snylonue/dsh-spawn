@@ -26,7 +26,7 @@ describe('spawn rendering', () => {
     const { tool } = await composeSpawn()
     const plain = foreground()
     expect(rendered(tool, plain)).toEqual(plain)
-    const failed = rendered(tool, foreground({ exitCode: 3, stderr: { text: 'bad', truncated: false } }))
+    const failed = rendered(tool, foreground({ exitCode: 3, stderr: { text: 'bad' } }))
     expect(failed.kind).toBe('foreground')
     expect(failed.exitCode).toBe(3)
     expect(failed.stdout.text).toBe('hello')
@@ -54,13 +54,21 @@ describe('spawn presentation', () => {
   it('presents a terminal card from the structured content', async () => {
     const { tool } = await composeSpawn()
     expect(tool.presentResult(ARGS, wrapped(foreground()))).toEqual({ card: 'terminal', output: 'hello', exitCode: 0 })
-    const split = foreground({ stdout: { text: 'a', truncated: false }, stderr: { text: 'b', truncated: false } })
+    const split = foreground({ stdout: { text: 'a' }, stderr: { text: 'b' } })
     expect(tool.presentResult(ARGS, wrapped(split)).output).toBe('a' + NL + '[stderr]' + NL + 'b')
-    const empty = foreground({ stdout: { text: '', truncated: false } })
+    const empty = foreground({ stdout: { text: '' } })
     expect(tool.presentResult(ARGS, wrapped(empty)).output).toBe('(no output)')
     expect(tool.presentResult(ARGS, wrapped(foreground({ signal: 'SIGTERM', exitCode: null }))).signal).toBe('SIGTERM')
     const spilled = foreground({ stdout: { text: 'x', truncated: true, spillPath: '/tmp/spill' } })
     expect(tool.presentResult(ARGS, wrapped(spilled)).output).toContain('/tmp/spill')
+  })
+
+  it('still presents older results with explicit empty stderr and false truncation', async () => {
+    const { tool } = await composeSpawn()
+    const legacy = foreground({ stdout: { text: 'hello', truncated: false }, stderr: { text: '', truncated: false } })
+    expect(tool.presentResult(ARGS, wrapped(legacy))).toEqual({ card: 'terminal', output: 'hello', exitCode: 0 })
+    const truncated = foreground({ stderr: { text: '', truncated: true, spillPath: '/tmp/err-spill' } })
+    expect(tool.presentResult(ARGS, wrapped(truncated)).output).toContain('/tmp/err-spill')
   })
 
   it('presents background, promoted and failed results', async () => {

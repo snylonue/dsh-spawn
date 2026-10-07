@@ -40,12 +40,7 @@ export function foreground(extra: Record<string, unknown> = {}): any {
   return {
     kind: 'foreground',
     exitCode: 0,
-    signal: null,
-    timedOut: false,
-    aborted: false,
-    timeoutMs: 60_000,
-    stdout: { text: 'hello', truncated: false },
-    stderr: { text: '', truncated: false },
+    stdout: { text: 'hello' },
     ...extra,
   }
 }
