@@ -55,7 +55,7 @@ import {
 } from '@deepseek-ai/dsh-shell'
 import type { JobId, JobOutcome, JobRegistry } from '@deepseek-ai/dsh-jobs'
 import { FiberState, type Context } from '@deepseek-ai/cordis'
-import { assertDirectlyExecutable, runProgram } from './direct-exec.js'
+import { runProgram } from './direct-exec.js'
 // The empty type-only imports pull in each host package's Cordis `Context`
 // augmentation (`ctx.subprocess`, `ctx.shellEnv`, `ctx.fs`,
 // `ctx.systemPrompt`) without adding any of them to the runtime import graph.
@@ -766,7 +766,6 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
         args.env,
         spawn.signal,
       )
-      assertDirectlyExecutable(executable)
       const argv = [executable, ...(args.args ?? [])]
       const approvedMode =
         args.sandbox_permissions !== undefined && args.justification !== undefined

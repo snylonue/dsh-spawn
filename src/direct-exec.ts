@@ -49,23 +49,6 @@ const EMPTY_READER: SubprocessOutputReader = {
   readFrom: () => ({ text: '', lossy: false, nextOffset: 0 }),
 }
 
-/**
- * Reject a Windows batch-file target: `CreateProcess` (and Node's `spawn`,
- * since the CVE-2024-27980 fix) cannot execute a `.cmd`/`.bat` without a
- * command shell, and building that shell string is the quoting layer this
- * module exists to avoid. The caller gets an actionable error instead of the
- * provider's `EINVAL`.
- * @param executable - the resolved `argv[0]`.
- * @param platform - the execution platform; defaults to the host.
- * @throws Error when the executable is a Windows batch file.
- */
-export function assertDirectlyExecutable(executable: string, platform: NodeJS.Platform = process.platform): void {
-  if (platform !== 'win32' || !/\.(cmd|bat)$/i.test(executable)) return
-  throw new Error(
-    `invalid command: ${JSON.stringify(executable)} is a Windows batch file, which cannot run without a command shell; invoke "cmd" with args ["/c", ...] or a real executable instead`,
-  )
-}
-
 /** Project a settled collect-mode reader into the final `CollectedOutput` shape. */
 function finalOutput(reader: SubprocessOutputReader): CollectedOutput {
   const read = reader.readFrom(0)
