@@ -139,7 +139,6 @@ interface ListDirValue { path: string; entries: ListDirEntry[]; truncated: boole
 interface SpawnArgs {
   command: string
   args?: string[]
-  description: string
   timeoutMs?: number
   cwd?: string
   stdin?: string
@@ -409,7 +408,6 @@ function spawnDescription() {
 }
 
 function validateSpawnArgs(args: SpawnArgs, effectiveMode: SandboxMode | undefined): void {
-  if (args.description.trim().length === 0) throw new Error('invalid description: expected a non-empty string')
   if (args.timeoutMs !== undefined && (!Number.isFinite(args.timeoutMs) || args.timeoutMs <= 0)) {
     throw new Error(`invalid timeoutMs: expected a positive number, got ${JSON.stringify(args.timeoutMs)}`)
   }
@@ -441,13 +439,12 @@ function presentSpawnCall(args: SpawnArgs): ToolCallView {
       title: command,
       kind: 'execute',
       rawInput: command,
-      content: [{ type: 'text', text: args.description }],
+      content: [],
     }
   }
   return {
     card: 'terminal',
     title: command,
-    description: args.description,
     ...(args.cwd !== undefined ? { cwd: args.cwd } : {}),
   }
 }
@@ -653,11 +650,6 @@ function spawnTool(ctx: Context, jobs: JobRegistry | undefined, options: SpawnTo
         type: 'array',
         items: { type: 'string' },
         description: 'argv entries, passed verbatim; shell metacharacters are literal.',
-      },
-      description: {
-        type: 'string',
-        required: true,
-        description: 'Short active-voice summary of the run, 5-10 words (shown in the UI).',
       },
       timeoutMs: {
         type: 'number',

@@ -33,7 +33,7 @@ export async function composeSpawn(): Promise<ComposedSpawn> {
 }
 
 /** The arguments every `spawn` render/present assertion reuses. */
-export const ARGS = { command: 'echo', args: ['hello'], description: 'Echo a greeting' }
+export const ARGS = { command: 'echo', args: ['hello'] }
 
 /** One foreground `spawn` value, overridable per assertion. */
 export function foreground(extra: Record<string, unknown> = {}): any {

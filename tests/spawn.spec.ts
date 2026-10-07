@@ -15,7 +15,7 @@ describe('spawn declaration', () => {
 
   it('exposes the argv contract in its parameter descriptions', async () => {
     const { tool } = await composeSpawn()
-    expect(tool.parameters.required).toEqual(['command', 'description'])
+    expect(tool.parameters.required).toEqual(['command'])
     expect(tool.parameters.properties.command.description).toContain('never a shell command line')
     expect(tool.parameters.properties.args.description).toContain('literal')
   })

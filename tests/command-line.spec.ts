@@ -185,7 +185,7 @@ async function capturedSpawn(
     inject: () => {},
   }
   mod.apply(ctx)
-  const input = { command, args, description: 'run a program' }
+  const input = { command, args }
   const result = await captured.execute(input, { signal: new AbortController().signal, callId: 'call-1' })
   return { ...calls.spawn[0], result, rendered: JSON.parse(captured.output.render(input, result)[0].text) }
 }
@@ -236,7 +236,7 @@ async function capturedConfinedSpawn(command: string, args: string[]): Promise<A
     inject: () => {},
   }
   mod.apply(ctx)
-  await captured.execute({ command, args, description: 'run a program' }, { signal: new AbortController().signal, callId: 'call-1' })
+  await captured.execute({ command, args }, { signal: new AbortController().signal, callId: 'call-1' })
   return calls
 }
 
