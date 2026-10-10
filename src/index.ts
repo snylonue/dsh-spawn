@@ -2,15 +2,10 @@
  * `dsh-spawn` — the typed process/path API that replaces `bash` in the
  * `PTC-spawn` agent preset (id `ptc-spawn`).
  *
- * Three model-facing tools, all callable inside a `run_code` program as
- * `tools.<name>(...)`:
- *
- * - `spawn`      run one program by argv (never a shell string), spawned
- *               directly through `ctx.subprocess` under the composition's sandbox
- *               policy (see `./direct-exec.js`) and escalatable through the
- *               shared approval choreography.
- * - `stat`      sandbox-aware metadata for one path.
- * - `list_dir`  bounded, depth-limited directory listing.
+ * The `spawn` tool runs one program by argv (never a shell string), directly
+ * through `ctx.subprocess` under the composition's sandbox policy and shared
+ * approval choreography. The independent `./stat` and `./list-dir` plugins
+ * provide filesystem queries.
  *
  * The job-aware `spawn` implementation deliberately mirrors
  * `@deepseek-ai/dsh-tool-bash`'s process plumbing (job registration, promotion
@@ -23,7 +18,6 @@
  *
  * @module dsh-spawn
  */
-import { stat as hostStat } from "node:fs/promises";
 import { isAbsolute, sep } from "node:path";
 import {
 	defineTool,
@@ -57,11 +51,10 @@ import type { JobId, JobOutcome, JobRegistry } from "@deepseek-ai/dsh-jobs";
 import { FiberState, type Context } from "@deepseek-ai/cordis";
 import { runProgram } from "./direct-exec.js";
 // The empty type-only imports pull in each host package's Cordis `Context`
-// augmentation (`ctx.subprocess`, `ctx.shellEnv`, `ctx.fs`,
+// augmentation (`ctx.subprocess`, `ctx.shellEnv`,
 // `ctx.systemPrompt`) without adding any of them to the runtime import graph.
 import type {} from "@deepseek-ai/dsh-subprocess";
 import type {} from "@deepseek-ai/dsh-shell-env";
-import type {} from "@deepseek-ai/dsh-fs";
 import type {} from "@deepseek-ai/dsh-system-prompt";
 
 // ── host packages ────────────────────────────────────────────────────────────
@@ -127,27 +120,6 @@ interface AttachedJob {
 	stopped(): string | undefined;
 }
 
-/** The `stat` value. */
-interface StatValue {
-	path: string;
-	exists: boolean;
-	type?: string;
-	size?: number;
-	mtimeMs?: number;
-}
-
-/** The `list_dir` value. */
-interface ListDirEntry {
-	path: string;
-	type: string;
-	size?: number;
-}
-interface ListDirValue {
-	path: string;
-	entries: ListDirEntry[];
-	truncated: boolean;
-}
-
 /** The validated `spawn` arguments this plugin reads. */
 interface SpawnArgs {
 	command: string;
@@ -159,12 +131,6 @@ interface SpawnArgs {
 	background?: boolean;
 	sandbox_permissions?: SandboxMode;
 	justification?: string;
-}
-
-/** The one path/name argument the query tools take. */
-interface PathArgs {
-	path: string;
-	depth?: number;
 }
 
 /** The resolution facts captured when the `spawn` tool was built. */
@@ -183,11 +149,6 @@ export const inject = [
 	"systemPrompt",
 	"shellEnv",
 ];
-
-/** Upper bound on one `list_dir` result, so a deep listing never floods the program. */
-const LIST_DIR_MAX_ENTRIES = 2000;
-/** Upper bound on `list_dir` recursion; depth is clamped into [1, 3]. */
-const LIST_DIR_MAX_DEPTH = 3;
 
 /** Display form for cards; never executed, so no validation is needed. */
 function displayCommand(command: string, args: string[] | undefined): string {
@@ -1010,188 +971,11 @@ function spawnTool(
 	});
 }
 
-// ── query tools ─────────────────────────────────────────────────────────────
-
-/** The session workspace the path tools resolve relative paths against. */
-function sessionCwd(spawn: ToolRunContext): string | undefined {
-	return spawn.agent?.session.header.cwd;
-}
-
-/**
- * Host-side `mtimeMs` for a resolved target, used only as an enrichment: the
- * filesystem service's own metadata has no timestamp, and a backend whose
- * process path is not a local absolute path simply reports none.
- */
-async function hostMtime(
-	processPath: string | undefined,
-): Promise<number | undefined> {
-	if (typeof processPath !== "string" || !isAbsolute(processPath))
-		return undefined;
-	try {
-		const info = await hostStat(processPath);
-		return typeof info.mtimeMs === "number" ? info.mtimeMs : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function statTool(ctx: Context): ToolDefinition {
-	return defineTool({
-		name: "stat",
-		description:
-			"Return metadata for one path: existence, type, byte size, and mtime when available.",
-		parameters: {
-			path: {
-				type: "string",
-				required: true,
-				description:
-					"Path to inspect; a relative path resolves against the session workspace.",
-			},
-		},
-		output: {
-			schema: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					path: { type: "string", required: true },
-					exists: { type: "boolean", required: true },
-					type: { type: "string" },
-					size: { type: "number" },
-					mtimeMs: { type: "number" },
-				},
-			},
-			render: (_args: PathArgs, value: StatValue) =>
-				value.exists
-					? [
-							{
-								type: "text",
-								text: `${value.path}: ${value.type}${value.size !== undefined ? `, ${value.size} bytes` : ""}${value.mtimeMs !== undefined ? `, modified ${new Date(value.mtimeMs).toISOString()}` : ""}`,
-							},
-						]
-					: [{ type: "text", text: `${value.path}: (absent)` }],
-		},
-		isConcurrencySafe: () => true,
-		async execute(args: PathArgs, spawn: ToolRunContext) {
-			const cwd = sessionCwd(spawn);
-			const target = await ctx.fs.resolve(args.path, {
-				...(cwd !== undefined ? { cwd } : {}),
-				signal: spawn.signal,
-			});
-			const info = await ctx.fs.stat(target, spawn.signal);
-			if (info === undefined)
-				return { path: target.displayPath, exists: false };
-			const mtimeMs = await hostMtime(ctx.fs.processPath(target));
-			return {
-				path: target.displayPath,
-				exists: true,
-				type: info.type,
-				...(info.size !== undefined ? { size: info.size } : {}),
-				...(mtimeMs !== undefined ? { mtimeMs } : {}),
-			};
-		},
-	});
-}
-
-function listDirTool(ctx: Context): ToolDefinition {
-	return defineTool({
-		name: "list_dir",
-		description: `List a directory's entries, one level deep by default; \`depth\` recurses up to ${LIST_DIR_MAX_DEPTH} levels. Results stop at ${LIST_DIR_MAX_ENTRIES} entries and report \`truncated\`.`,
-		parameters: {
-			path: {
-				type: "string",
-				required: true,
-				description:
-					"Directory to list; a relative path resolves against the session workspace.",
-			},
-			depth: {
-				type: "integer",
-				description: `Directory levels to walk (1..${LIST_DIR_MAX_DEPTH}); defaults to 1.`,
-			},
-		},
-		output: {
-			schema: {
-				type: "object",
-				additionalProperties: false,
-				properties: {
-					path: { type: "string", required: true },
-					entries: {
-						type: "array",
-						required: true,
-						items: {
-							type: "object",
-							additionalProperties: false,
-							properties: {
-								path: { type: "string", required: true },
-								type: { type: "string", required: true },
-								size: { type: "number" },
-							},
-						},
-					},
-					truncated: { type: "boolean", required: true },
-				},
-			},
-			render: (_args: PathArgs, value: ListDirValue) => [
-				{
-					type: "text",
-					text:
-						value.entries.length === 0
-							? `${value.path}: (empty)`
-							: `${value.path}:\n${value.entries
-									.map(
-										(entry) =>
-											`${entry.type === "directory" ? "dir " : "file"} ${entry.path}${entry.size !== undefined ? ` (${entry.size} bytes)` : ""}`,
-									)
-									.join(
-										"\n",
-									)}${value.truncated ? "\n[listing truncated]" : ""}`,
-				},
-			],
-		},
-		isConcurrencySafe: () => true,
-		async execute(args: PathArgs, spawn: ToolRunContext) {
-			const cwd = sessionCwd(spawn);
-			const root = await ctx.fs.resolve(args.path, {
-				...(cwd !== undefined ? { cwd } : {}),
-				signal: spawn.signal,
-			});
-			const depth = Math.max(1, Math.min(LIST_DIR_MAX_DEPTH, args.depth ?? 1));
-			const entries = [];
-			let truncated = false;
-			let level = [{ target: root, depth: 1 }];
-			while (level.length > 0 && !truncated) {
-				const next = [];
-				for (const item of level) {
-					const children = await ctx.fs.listDir(item.target, spawn.signal);
-					for (const child of children) {
-						if (entries.length >= LIST_DIR_MAX_ENTRIES) {
-							truncated = true;
-							break;
-						}
-						entries.push({
-							path: child.target.displayPath,
-							type: child.type,
-							...(child.size !== undefined ? { size: child.size } : {}),
-						});
-						if (item.depth < depth && child.type === "directory") {
-							next.push({ target: child.target, depth: item.depth + 1 });
-						}
-					}
-					if (truncated) break;
-				}
-				level = next;
-			}
-			return { path: root.displayPath, entries, truncated };
-		},
-	});
-}
-
 // ── plugin entry ────────────────────────────────────────────────────────────
 
 /**
- * Register the three tools. `spawn` waits for the optional job registry so its
- * background and promotion paths exist exactly when `job_output`/`job_kill`
- * do; the two path tools wait for their own capability seams and are simply
- * absent in a composition that lacks them.
+ * Register `spawn`. It waits for the optional job registry so its background
+ * and promotion paths exist exactly when `job_output`/`job_kill` do.
  * @param ctx - the plugin context.
  */
 export function apply(ctx: Context): void {
@@ -1229,10 +1013,5 @@ export function apply(ctx: Context): void {
 			if (ctx.fiber.state === FiberState.ACTIVE)
 				foregroundOnly = ctx.tools.register(spawnTool(ctx, undefined, options));
 		});
-	});
-
-	ctx.inject(["fs"], (fsCtx: Context) => {
-		fsCtx.tools.register(statTool(fsCtx));
-		fsCtx.tools.register(listDirTool(fsCtx));
 	});
 }
