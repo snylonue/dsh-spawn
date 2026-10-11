@@ -1,42 +1,70 @@
-/**
- * Shared test helpers: compose the built plugin over a stub context the way a dsh
- * composition would, and build the value/result fixtures the render and presenter
- * paths take.
- */
+/** Shared test helpers for the required jobs and sandbox composition. */
 export interface ComposedSpawn {
 	tool: any;
-	sandboxed: boolean;
 }
 
-/** Compose the built plugin and return the `spawn` definition it registers. */
+/** A job registry stub that runs the producer and waits for its settlement. */
+export function createJobs(): any {
+	let nextId = 0;
+	const hooks = new Map<string, any>();
+	return {
+		start: (spec: any) => {
+			const id = "spawn-" + ++nextId;
+			hooks.set(id, spec.run());
+			return id;
+		},
+		wait: async (id: string, timeoutMs: number) => {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				return await Promise.race([
+					hooks.get(id).done,
+					new Promise((resolve) => {
+						timer = setTimeout(() => resolve({ status: "running" }), timeoutMs);
+					}),
+				]);
+			} finally {
+				clearTimeout(timer);
+			}
+		},
+		kill: (id: string, _owner: unknown, reason: unknown) =>
+			hooks.get(id).cancel(reason),
+		remove: (id: string) => {
+			hooks.delete(id);
+		},
+		read: () => ({
+			chunks: [],
+			lossy: false,
+			job: { output: { spillPaths: [] } },
+		}),
+	};
+}
+
+/** Compose the built plugin and return the registered definition. */
 export async function composeSpawn(): Promise<ComposedSpawn> {
 	const mod: any = await import(
 		new URL("../dist/index.js", import.meta.url).href
 	);
-	for (const sandboxed of [true, false]) {
-		let captured: any;
-		const ctx: any = {
-			shell: sandboxed ? { sandboxMode: "workspace-write" } : {},
-			get: () => undefined,
-			logger: { warn: () => {} },
-			systemPrompt: { section: () => {}, getSectionOrder: () => 0 },
-			tools: {
-				register: (definition: any) => {
-					captured = definition;
-					return () => {};
-				},
+	let captured: any;
+	const ctx: any = {
+		jobs: createJobs(),
+		sandbox: {
+			confine: () => {
+				throw new Error("unexpected confinement");
 			},
-			inject: () => {},
-		};
-		try {
-			mod.apply(ctx);
-			if (captured !== undefined) return { tool: captured, sandboxed };
-		} catch {
-			// The sandboxed composition needs the running installation's sandbox
-			// helpers; fall through to the sandbox-free composition.
-		}
-	}
-	throw new Error("spawn did not register");
+		},
+		sandboxPolicy: {
+			resolve: () => ({ mode: "workspace-write", workspaceRoot: "/ws" }),
+		},
+		systemPrompt: { section: () => {}, getSectionOrder: () => 0 },
+		tools: {
+			register: (definition: any) => {
+				captured = definition;
+				return () => {};
+			},
+		},
+	};
+	mod.apply(ctx);
+	return { tool: captured };
 }
 
 /** The arguments every `spawn` render/present assertion reuses. */

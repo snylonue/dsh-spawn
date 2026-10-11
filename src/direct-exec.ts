@@ -20,7 +20,6 @@ import {
 	matchesSignature,
 	type ConfinedArgv,
 	type SandboxPolicy,
-	type SandboxProvider,
 } from "@deepseek-ai/dsh-sandbox";
 import type {
 	CollectedOutput,
@@ -73,8 +72,7 @@ function confinedPolicyOf(spec: ShellExecSpec): SandboxPolicy | undefined {
 /**
  * Spawn one argv vector under this process's sandbox policy and adapt the
  * provider handle to the shell execution shape the tool's job plumbing uses.
- * @param ctx - the plugin context (needs `ctx.subprocess`).
- * @param sandbox - the sandbox provider, read through `ctx.get` so a composition without one still loads.
+ * @param ctx - the plugin context (needs `ctx.subprocess` and `ctx.sandbox`).
  * @param spec - resolved budgets/policy, from `ctx.shell.resolve`.
  * @param argv - the exact program argv; `argv[0]` is already an executable path.
  * @param signal - the caller's cancellation; overrides `spec.signal` when given.
@@ -82,7 +80,6 @@ function confinedPolicyOf(spec: ShellExecSpec): SandboxPolicy | undefined {
  */
 export async function runProgram(
 	ctx: Context,
-	sandbox: SandboxProvider | undefined,
 	spec: ShellExecSpec,
 	argv: readonly string[],
 	signal: AbortSignal | undefined,
@@ -90,11 +87,6 @@ export async function runProgram(
 	const policy = spec.sandboxPolicy;
 	const confinedPolicy = confinedPolicyOf(spec);
 	const effectiveSignal = signal ?? spec.signal;
-	if (confinedPolicy !== undefined && sandbox === undefined) {
-		throw new Error(
-			"dsh-spawn: a confining mode is set but ctx.sandbox is missing from this composition",
-		);
-	}
 
 	let spawnSignal: AbortSignal | undefined;
 	let classify: () => { timedOut: boolean; aborted: boolean };
@@ -131,7 +123,7 @@ export async function runProgram(
 			confined = await Promise.race([
 				Promise.resolve().then(() => {
 					bound.throwIfAborted();
-					return sandbox!.confine(argv, confinedPolicy, bound);
+					return ctx.sandbox.confine(argv, confinedPolicy, bound);
 				}),
 				cancelled,
 			]);

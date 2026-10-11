@@ -15,6 +15,9 @@ async function setup() {
 	ctx.provide("shell", {} as any);
 	ctx.provide("subprocess", {} as any);
 	ctx.provide("shellEnv", {} as any);
+	ctx.provide("jobs", {} as any);
+	ctx.provide("sandbox", {} as any);
+	ctx.provide("sandboxPolicy", {} as any);
 	ctx.provide("fs", {} as any);
 	await ctx.plugin(ToolRuntime);
 	await ctx.plugin(spawnPlugin);

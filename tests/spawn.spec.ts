@@ -10,6 +10,23 @@ import {
 const NL = String.fromCharCode(10);
 
 describe("spawn declaration", () => {
+	it("requires jobs and sandbox and always exposes their parameters", async () => {
+		const mod = await import(new URL("../dist/index.js", import.meta.url).href);
+		expect(mod.inject).toEqual(
+			expect.arrayContaining(["jobs", "sandbox", "sandboxPolicy"]),
+		);
+		const { tool } = await composeSpawn();
+		expect(tool.parameters.properties.background.type).toBe("boolean");
+		expect(tool.parameters.properties.sandbox_permissions.enum).toEqual([
+			"workspace-write",
+			"danger-full-access",
+		]);
+		expect(tool.parameters.properties.justification.type).toBe("string");
+		expect(tool.parameters.properties.timeoutMs.description).toContain(
+			"moves to the background",
+		);
+	});
+
 	it("is described as a no-shell argv API", async () => {
 		const { tool } = await composeSpawn();
 		expect(tool.description).toContain("no shell");
@@ -63,7 +80,7 @@ describe("spawn rendering", () => {
 			foreground({ sandbox: { mode: "workspace-write", denied: true } }),
 		);
 		expect(denied.sandbox.denied).toBe(true);
-		expect(denied.hints).toHaveLength(1);
+		expect(denied.hints).toHaveLength(2);
 		expect(denied.hints[0]).toMatch(/file access denied/);
 		expect(
 			rendered(tool, { kind: "background", jobId: "job-1" }).hints,

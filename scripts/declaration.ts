@@ -22,24 +22,17 @@ const fakeJobs = {
 function compose(): { tool: any; composition: string } {
 	let captured: any;
 	const ctx: any = {
-		shell: { sandboxMode: "workspace-write" },
-		get: (name: string) =>
-			name === "jobs"
-				? fakeJobs
-				: name === "sandboxPolicy"
-					? { resolve: () => ({ mode: "workspace-write" }) }
-					: undefined,
-		logger: { warn: () => {} },
+		jobs: fakeJobs,
+		sandbox: {},
+		sandboxPolicy: {
+			resolve: () => ({ mode: "workspace-write", workspaceRoot: "/ws" }),
+		},
 		systemPrompt: { section: () => {}, getSectionOrder: () => 0 },
 		tools: {
 			register: (definition: any) => {
 				captured = definition;
 				return () => {};
 			},
-		},
-		inject: (names: string[], apply: (ctx: any) => void) => {
-			if (names.includes("jobs"))
-				apply({ jobs: fakeJobs, effect: () => () => {} });
 		},
 	};
 	mod.apply(ctx);

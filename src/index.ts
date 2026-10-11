@@ -47,12 +47,18 @@ import {
 	type ShellRunResult,
 	type ShellSandboxInfo,
 } from "@deepseek-ai/dsh-shell";
-import type { JobId, JobOutcome, JobRegistry } from "@deepseek-ai/dsh-jobs";
-import { FiberState, type Context } from "@deepseek-ai/cordis";
+import type {
+	JobId,
+	JobOutcome,
+	JobRegistry,
+	JobView,
+} from "@deepseek-ai/dsh-jobs";
+import type { Context } from "@deepseek-ai/cordis";
 import { runProgram } from "./direct-exec.js";
 // The empty type-only imports pull in each host package's Cordis `Context`
-// augmentation (`ctx.subprocess`, `ctx.shellEnv`,
+// augmentation (`ctx.sandboxPolicy`, `ctx.subprocess`, `ctx.shellEnv`,
 // `ctx.systemPrompt`) without adding any of them to the runtime import graph.
+import type {} from "@deepseek-ai/dsh-sandbox-policy";
 import type {} from "@deepseek-ai/dsh-subprocess";
 import type {} from "@deepseek-ai/dsh-shell-env";
 import type {} from "@deepseek-ai/dsh-system-prompt";
@@ -133,19 +139,14 @@ interface SpawnArgs {
 	justification?: string;
 }
 
-/** The resolution facts captured when the `spawn` tool was built. */
-interface SpawnToolOptions {
-	escalationModes: readonly SandboxMode[];
-	resolveSandboxPolicy(
-		spawn: ToolRunContext,
-	): SandboxExecutionPolicy | undefined;
-}
-
 export const name = "dsh-spawn";
 export const inject = [
 	"tools",
 	"shell",
 	"subprocess",
+	"jobs",
+	"sandbox",
+	"sandboxPolicy",
 	"systemPrompt",
 	"shellEnv",
 ];
@@ -161,10 +162,7 @@ function displayCommand(command: string, args: string[] | undefined): string {
  * Sandbox facts worth the terminal detail: a runner that never ran the
  * command, or a denial (with the escalation hint this composition offers).
  */
-function sandboxNotes(
-	sandbox: ShellSandboxInfo | undefined,
-	escalationModes: readonly string[],
-): string[] {
+function sandboxNotes(sandbox: ShellSandboxInfo | undefined): string[] {
 	if (sandbox?.runnerFailed) {
 		return [
 			`[sandbox: the sandbox runner itself failed under ${sandbox.mode} mode — the command did not run; this is a sandbox problem, not a command failure]`,
@@ -172,17 +170,14 @@ function sandboxNotes(
 	}
 	if (sandbox?.denied) {
 		const notes = [sandboxDenialMarker(sandbox.mode)];
-		if (escalationModes.length > 0) notes.push(escalationHintMarker("command"));
+		notes.push(escalationHintMarker("command"));
 		return notes;
 	}
 	return [];
 }
 
 /** Map a settled background process onto the generic job-outcome vocabulary. */
-function processOutcome(
-	proc: ShellExecution,
-	escalationModes: readonly string[] = [],
-): JobOutcome {
+function processOutcome(proc: ShellExecution): JobOutcome {
 	const base: JobOutcome =
 		proc.status === "killed"
 			? {
@@ -196,7 +191,7 @@ function processOutcome(
 					status: "completed",
 					detail: `exit code: ${proc.exitCode ?? 0}`,
 				};
-	const notes = sandboxNotes(proc.sandbox, escalationModes);
+	const notes = sandboxNotes(proc.sandbox);
 	return notes.length === 0
 		? base
 		: { ...base, detail: `${base.detail}; ${notes.join(" ")}` };
@@ -299,10 +294,7 @@ function spawnBody(result: {
  * command, a deadline, a stop, or a promotion. Every other fact about a run is
  * carried by its own field, so a consumer reads fields instead of markers.
  */
-function spawnHints(
-	value: SpawnValue,
-	escalationModes: readonly string[] = [],
-): string[] {
+function spawnHints(value: SpawnValue): string[] {
 	if (value.kind === "promoted") {
 		return [
 			`still running after ${value.timeoutMs}ms; moved to background job ${value.jobId}`,
@@ -318,7 +310,7 @@ function spawnHints(
 	}
 	if (value.sandbox?.denied) {
 		hints.push(sandboxDenialMarker(value.sandbox.mode));
-		if (escalationModes.length > 0) hints.push(escalationHintMarker("command"));
+		hints.push(escalationHintMarker("command"));
 	}
 	if (value.timedOut) hints.push(`timed out after ${value.timeoutMs}ms`);
 	if (value.stopped !== undefined) hints.push(`stopped: ${value.stopped}`);
@@ -336,11 +328,8 @@ function spawnHints(
  * phrase. Nothing is flattened into prose, so a consumer reads fields instead
  * of parsing markers.
  */
-function structuredResult(
-	value: SpawnValue,
-	escalationModes: readonly string[] = [],
-): RenderedSpawn {
-	const hints = spawnHints(value, escalationModes);
+function structuredResult(value: SpawnValue): RenderedSpawn {
+	const hints = spawnHints(value);
 	return hints.length === 0 ? value : { ...value, hints };
 }
 
@@ -357,7 +346,6 @@ function renderJobRead(
 	lossy: boolean,
 	spillPaths: readonly string[],
 	sandbox: ShellSandboxInfo | undefined,
-	escalationModes: readonly string[] = [],
 ): string {
 	const notices = [];
 	if (lossy) {
@@ -371,8 +359,7 @@ function renderJobRead(
 		);
 	} else if (sandbox?.denied) {
 		notices.push(sandboxDenialMarker(sandbox.mode));
-		if (escalationModes.length > 0)
-			notices.push(escalationHintMarker("command"));
+		notices.push(escalationHintMarker("command"));
 	}
 	if (notices.length === 0) return delta;
 	return `${delta}${delta.length > 0 && !delta.endsWith("\n") ? "\n" : ""}${notices.join("\n")}`;
@@ -596,39 +583,20 @@ function resolveWorkdir(
 }
 
 /**
- * Build the `spawn` definition. With a job registry every call registers its
- * process as a job at its start; without one the tool is foreground-only and
- * the executor's deadline kills the program.
+ * Build the `spawn` definition. Every call registers its process as a job
+ * at its start, and a foreground wait promotes it on timeout.
  * @param ctx - the plugin context.
- * @param jobs - the job registry, when composed.
- * @param options - resolution facts captured at apply time.
  * @returns the registry-ready tool definition.
  */
-function spawnTool(
-	ctx: Context,
-	jobs: JobRegistry | undefined,
-	options: SpawnToolOptions,
-): ToolDefinition {
-	const { escalationModes, resolveSandboxPolicy } = options;
-	const background = jobs !== undefined;
-	const promote = background;
+function spawnTool(ctx: Context): ToolDefinition {
+	const jobs = ctx.jobs;
 
 	const approveSpawnEscalation = (
 		mode: SandboxMode,
 		justification: string,
 		spawn: ToolRunContext,
-		standingPolicy: SandboxExecutionPolicy | undefined,
+		standingPolicy: SandboxExecutionPolicy,
 	) => {
-		if (escalationModes.length === 0) {
-			throw new Error(
-				"sandbox_permissions is not available in this composition (no sandboxing executor to escalate)",
-			);
-		}
-		if (standingPolicy === undefined) {
-			throw new Error(
-				"sandbox_permissions is not available without a sandbox execution policy",
-			);
-		}
 		return approveEscalation(
 			{
 				requestedMode: mode,
@@ -662,19 +630,10 @@ function spawnTool(
 				...(spawn.agent ? { owner: spawn.agent.id } : {}),
 				output: processSources(() => proc),
 				run: () => {
-					const hooks = processJob(
-						async (signal) => {
-							proc = await runProgram(
-								ctx,
-								ctx.get("sandbox"),
-								spec,
-								argv,
-								signal,
-							);
-							return proc;
-						},
-						(started) => processOutcome(started, escalationModes),
-					);
+					const hooks = processJob(async (signal) => {
+						proc = await runProgram(ctx, spec, argv, signal);
+						return proc;
+					}, processOutcome);
 					return {
 						done: hooks.done,
 						cancel: (reason: unknown) => {
@@ -704,7 +663,7 @@ function spawnTool(
 				registry.remove(attached.id, owner);
 			return settled;
 		};
-		let view;
+		let view: JobView;
 		try {
 			view = await registry.wait(attached.id, timeoutMs, owner, spawn.signal);
 		} catch {
@@ -735,7 +694,6 @@ function spawnTool(
 					read.lossy,
 					read.job.output.spillPaths ?? [],
 					attached.process()?.sandbox,
-					escalationModes,
 				),
 			};
 		}
@@ -768,9 +726,8 @@ function spawnTool(
 			},
 			timeoutMs: {
 				type: "number",
-				description: promote
-					? "Timeout in ms; on expiry the run moves to the background as a job."
-					: "Timeout in ms; the program is killed on expiry.",
+				description:
+					"Timeout in ms; on expiry the run moves to the background as a job.",
 			},
 			cwd: {
 				type: "string",
@@ -785,29 +742,21 @@ function spawnTool(
 				type: "json",
 				description: `Extra environment variables as string values; ${DSH_ENV_PREFIX}* names are harness-managed and rejected.`,
 			},
-			...(background
-				? {
-						background: {
-							type: "boolean",
-							description:
-								"Start as a background job and return its job id immediately.",
-						},
-					}
-				: {}),
-			...(escalationModes.length > 0
-				? {
-						sandbox_permissions: {
-							type: "string",
-							enum: [...escalationModes],
-							description: sandboxPermissionsDescription("command"),
-						},
-						justification: {
-							type: "string",
-							description:
-								"Required with sandbox_permissions: why this exact program needs wider access.",
-						},
-					}
-				: {}),
+			background: {
+				type: "boolean",
+				description:
+					"Start as a background job and return its job id immediately.",
+			},
+			sandbox_permissions: {
+				type: "string",
+				enum: [...ESCALATION_TARGETS],
+				description: sandboxPermissionsDescription("command"),
+			},
+			justification: {
+				type: "string",
+				description:
+					"Required with sandbox_permissions: why this exact program needs wider access.",
+			},
 		},
 		output: {
 			schema: {
@@ -877,21 +826,19 @@ function spawnTool(
 			render: (_args: SpawnArgs, value: SpawnValue) => [
 				{
 					type: "text",
-					text: JSON.stringify(
-						structuredResult(value, escalationModes),
-						null,
-						2,
-					),
+					text: JSON.stringify(structuredResult(value), null, 2),
 				},
 			],
 		},
 		async execute(args: SpawnArgs, spawn: ToolRunContext): Promise<SpawnValue> {
-			const standingPolicy = resolveSandboxPolicy(spawn);
-			validateSpawnArgs(args, standingPolicy?.mode);
+			const standingPolicy = ctx.sandboxPolicy.resolve(
+				spawn.agent === undefined ? {} : { session: spawn.agent.session },
+			);
+			validateSpawnArgs(args, standingPolicy.mode);
 			const workdir = resolveWorkdir(
 				args.cwd,
 				spawn,
-				standingPolicy?.workspaceRoot,
+				standingPolicy.workspaceRoot,
 			);
 			// Environment providers wrap these subprocess methods transparently.
 			// Resolve argv[0] in the execution world before any approval or spawn,
@@ -913,7 +860,7 @@ function spawnTool(
 						)
 					: undefined;
 			const policy =
-				approvedMode === undefined || standingPolicy === undefined
+				approvedMode === undefined
 					? standingPolicy
 					: { ...standingPolicy, mode: approvedMode };
 			const dshEnv = ctx.shellEnv.collect(spawn);
@@ -926,14 +873,9 @@ function spawnTool(
 				...(args.stdin !== undefined ? { stdin: args.stdin } : {}),
 				...(args.env !== undefined ? { env: args.env } : {}),
 				dshEnv,
-				...(policy !== undefined ? { sandboxPolicy: policy } : {}),
+				sandboxPolicy: policy,
 			};
 			if (args.background === true) {
-				if (jobs === undefined) {
-					throw new Error(
-						"background jobs unavailable: load @deepseek-ai/dsh-jobs and @deepseek-ai/dsh-tool-jobs",
-					);
-				}
 				if (spawn.signal.aborted) throw toolAborted();
 				return {
 					kind: "background",
@@ -946,25 +888,9 @@ function spawnTool(
 					).id,
 				};
 			}
-			if (jobs !== undefined && promote) {
-				const spec = ctx.shell.resolve({ ...request, onExpiry: "none" });
-				let attached;
-				try {
-					attached = startJob(jobs, args, spawn, spec, argv);
-				} catch (error) {
-					ctx.logger.warn(
-						`dsh-spawn: job registration refused, running in the foreground with the timeout kill instead: ${String(error)}`,
-					);
-				}
-				if (attached !== undefined)
-					return waitOnJob(jobs, attached, spawn, spec);
-			}
-			const spec = ctx.shell.resolve({ ...request, signal: spawn.signal });
-			const result = await (
-				await runProgram(ctx, ctx.get("sandbox"), spec, argv, spawn.signal)
-			).result();
-			if (result.aborted) throw toolAborted();
-			return { kind: "foreground", ...canonicalRunResult(result) };
+			const spec = ctx.shell.resolve({ ...request, onExpiry: "none" });
+			const attached = startJob(jobs, args, spawn, spec, argv);
+			return waitOnJob(jobs, attached, spawn, spec);
 		},
 		presentCall: presentSpawnCall,
 		presentResult: presentSpawnResult,
@@ -974,44 +900,15 @@ function spawnTool(
 // ── plugin entry ────────────────────────────────────────────────────────────
 
 /**
- * Register `spawn`. It waits for the optional job registry so its background
- * and promotion paths exist exactly when `job_output`/`job_kill` do.
+ * Register `spawn` with the required jobs and sandbox services.
  * @param ctx - the plugin context.
  */
 export function apply(ctx: Context): void {
-	const defaultMode = ctx.shell.sandboxMode;
-	const escalationModes = defaultMode === undefined ? [] : ESCALATION_TARGETS;
-	const sandboxPolicy =
-		defaultMode === undefined ? undefined : ctx.get("sandboxPolicy");
-	if (defaultMode !== undefined && sandboxPolicy === undefined) {
-		throw new Error(
-			"dsh-spawn: the mounted shell executor confines but ctx.sandboxPolicy is missing",
-		);
-	}
-	const resolveSandboxPolicy = (spawn: ToolRunContext) =>
-		sandboxPolicy?.resolve(
-			spawn.agent === undefined ? {} : { session: spawn.agent.session },
-		);
-
 	ctx.systemPrompt.section({
 		name: "tool:spawn",
 		order: ctx.systemPrompt.getSectionOrder("TOOL_BASH"),
 		text: "Programs run by `spawn` take an explicit argv and no shell; read the returned `exitCode` (or `signal`) on every result.",
 	});
 
-	const options = { escalationModes, resolveSandboxPolicy };
-	let foregroundOnly =
-		ctx.get("jobs") === undefined
-			? ctx.tools.register(spawnTool(ctx, undefined, options))
-			: undefined;
-	ctx.inject(["jobs"], (jobCtx: Context) => {
-		foregroundOnly?.();
-		foregroundOnly = undefined;
-		const unregister = ctx.tools.register(spawnTool(ctx, jobCtx.jobs, options));
-		jobCtx.effect(() => () => {
-			unregister();
-			if (ctx.fiber.state === FiberState.ACTIVE)
-				foregroundOnly = ctx.tools.register(spawnTool(ctx, undefined, options));
-		});
-	});
+	ctx.tools.register(spawnTool(ctx));
 }

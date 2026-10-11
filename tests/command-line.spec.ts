@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { createJobs } from "./helpers.js";
 
 type Any = any;
 
@@ -72,6 +73,7 @@ function runner(confined?: Any, spawned: Any = handle("out", "", 0)) {
 		},
 	};
 	const ctx: Any = {
+		sandbox,
 		subprocess: {
 			spawn: (s: Any) => {
 				calls.spawn.push(s);
@@ -79,7 +81,7 @@ function runner(confined?: Any, spawned: Any = handle("out", "", 0)) {
 			},
 		},
 	};
-	return { ctx, sandbox, calls };
+	return { ctx, calls };
 }
 
 const READ_ONLY = { mode: "read-only", workspaceRoot: "/ws" };
@@ -87,10 +89,9 @@ const READ_ONLY = { mode: "read-only", workspaceRoot: "/ws" };
 describe("direct argv execution", () => {
 	it("spawns the program argv with no shell layer", async () => {
 		const { runProgram } = await directExec();
-		const { ctx, sandbox, calls } = runner();
+		const { ctx, calls } = runner();
 		const proc = await runProgram(
 			ctx,
-			sandbox,
 			spec(),
 			["/usr/bin/node", "--version"],
 			undefined,
@@ -114,11 +115,10 @@ describe("direct argv execution", () => {
 			denialSignatures: ["Permission denied"],
 			runnerFailureRules: [],
 		};
-		const { ctx, sandbox, calls } = runner(confined);
+		const { ctx, calls } = runner(confined);
 		const result = await (
 			await runProgram(
 				ctx,
-				sandbox,
 				spec({
 					sandboxPolicy: { mode: "workspace-write", workspaceRoot: "/ws" },
 				}),
@@ -143,14 +143,13 @@ describe("direct argv execution", () => {
 			denialSignatures: ["Permission denied"],
 			runnerFailureRules: [],
 		};
-		const { ctx, sandbox } = runner(
+		const { ctx } = runner(
 			confined,
 			handle("", "cat: /x: Permission denied", 1),
 		);
 		const result = await (
 			await runProgram(
 				ctx,
-				sandbox,
 				spec({ sandboxPolicy: READ_ONLY }),
 				["prog"],
 				undefined,
@@ -167,12 +166,11 @@ describe("direct argv execution", () => {
 			denialSignatures: [],
 			runnerFailureRules: [{ fatalSignatures: ["runner exploded"] }],
 		};
-		const { ctx, sandbox } = runner(confined, handle("", "runner exploded", 3));
+		const { ctx } = runner(confined, handle("", "runner exploded", 3));
 		await expect(
 			(
 				await runProgram(
 					ctx,
-					sandbox,
 					spec({ sandboxPolicy: READ_ONLY }),
 					["prog"],
 					undefined,
@@ -183,11 +181,10 @@ describe("direct argv execution", () => {
 
 	it("reports full access without confining", async () => {
 		const { runProgram } = await directExec();
-		const { ctx, sandbox, calls } = runner();
+		const { ctx, calls } = runner();
 		const result = await (
 			await runProgram(
 				ctx,
-				sandbox,
 				spec({
 					sandboxPolicy: { mode: "danger-full-access", workspaceRoot: "/ws" },
 				}),
@@ -202,20 +199,20 @@ describe("direct argv execution", () => {
 		});
 	});
 
-	it("rejects a Windows batch-file target with an actionable error", async () => {
-		const { assertDirectlyExecutable } = await directExec();
-		expect(() =>
-			assertDirectlyExecutable("C:\\Users\\me\\npm.cmd", "win32"),
-		).toThrow(/batch file/);
-		expect(() =>
-			assertDirectlyExecutable("C:\\tools\\run.BAT", "win32"),
-		).toThrow(/batch file/);
-		expect(() =>
-			assertDirectlyExecutable("C:\\nodejs\\node.exe", "win32"),
-		).not.toThrow();
-		expect(() =>
-			assertDirectlyExecutable("/usr/bin/npm.cmd", "linux"),
-		).not.toThrow();
+	it("propagates executable resolution failure before registering a job", async () => {
+		let start: Any;
+		let spawn: Any;
+		await expect(
+			capturedSpawn("npm.cmd", [], handle("ok", "", 0), {}, (ctx) => {
+				start = vi.spyOn(ctx.jobs, "start");
+				spawn = vi.spyOn(ctx.subprocess, "spawn");
+				ctx.subprocess.resolveExecutable = async () => {
+					throw new Error("batch file requires a command shell");
+				};
+			}),
+		).rejects.toThrow("batch file requires a command shell");
+		expect(start).not.toHaveBeenCalled();
+		expect(spawn).not.toHaveBeenCalled();
 	});
 });
 
@@ -224,6 +221,8 @@ async function capturedSpawn(
 	command: string,
 	args: string[],
 	spawned: Any = handle("ok", "", 0),
+	options: Any = {},
+	setup: (ctx: Any) => void = () => {},
 ): Promise<Any> {
 	const mod = await plugin();
 	let captured: Any;
@@ -250,8 +249,15 @@ async function capturedSpawn(
 				return spawned;
 			},
 		},
-		get: () => undefined,
-		logger: { warn: () => {} },
+		jobs: createJobs(),
+		sandbox: {
+			confine: () => {
+				throw new Error("unexpected confinement");
+			},
+		},
+		sandboxPolicy: {
+			resolve: () => ({ mode: "danger-full-access", workspaceRoot: "/tmp" }),
+		},
 		systemPrompt: { section: () => {}, getSectionOrder: () => 0 },
 		shellEnv: { collect: () => ({}) },
 		tools: {
@@ -260,16 +266,17 @@ async function capturedSpawn(
 				return () => {};
 			},
 		},
-		inject: () => {},
 	};
+	setup(ctx);
 	mod.apply(ctx);
-	const input = { command, args };
+	const input = { command, args, ...options };
 	const result = await captured.execute(input, {
 		signal: new AbortController().signal,
 		callId: "call-1",
 	});
 	return {
 		...calls.spawn[0],
+		jobs: ctx.jobs,
 		result,
 		rendered: JSON.parse(captured.output.render(input, result)[0].text),
 	};
@@ -315,13 +322,9 @@ async function capturedConfinedSpawn(
 				return spawned;
 			},
 		},
-		get: (name: string) =>
-			name === "sandbox"
-				? sandbox
-				: name === "sandboxPolicy"
-					? { resolve: () => policy }
-					: undefined,
-		logger: { warn: () => {} },
+		jobs: createJobs(),
+		sandbox,
+		sandboxPolicy: { resolve: () => policy },
 		systemPrompt: { section: () => {}, getSectionOrder: () => 0 },
 		shellEnv: { collect: () => ({}) },
 		tools: {
@@ -330,7 +333,6 @@ async function capturedConfinedSpawn(
 				return () => {};
 			},
 		},
-		inject: () => {},
 	};
 	mod.apply(ctx);
 	await captured.execute(
@@ -339,6 +341,56 @@ async function capturedConfinedSpawn(
 	);
 	return calls;
 }
+
+describe("spawn jobs", () => {
+	it("starts background work without waiting for it", async () => {
+		let wait: Any;
+		const spawned = await capturedSpawn(
+			"node",
+			[],
+			handle("ok", "", 0),
+			{ background: true },
+			(ctx) => {
+				wait = vi.spyOn(ctx.jobs, "wait");
+			},
+		);
+		expect(spawned.result).toEqual({ kind: "background", jobId: "spawn-1" });
+		expect(wait).not.toHaveBeenCalled();
+		await spawned.jobs.wait(spawned.result.jobId, 1000);
+	});
+
+	it("promotes a running foreground job on timeout", async () => {
+		const process = handle("partial", "", 0);
+		let finish!: (outcome: { exitCode: number; signal: null }) => void;
+		process.done = new Promise((resolve) => {
+			finish = resolve;
+		});
+		const spawned = await capturedSpawn("node", [], process, { timeoutMs: 1 });
+		try {
+			expect(spawned.result).toMatchObject({
+				kind: "promoted",
+				jobId: "spawn-1",
+				timeoutMs: 1,
+			});
+		} finally {
+			finish({ exitCode: 0, signal: null });
+			await spawned.jobs.wait(spawned.result.jobId, 1000);
+		}
+	});
+
+	it("propagates job registration failure before spawning the program", async () => {
+		let spawn: Any;
+		await expect(
+			capturedSpawn("node", [], handle("ok", "", 0), {}, (ctx) => {
+				spawn = vi.spyOn(ctx.subprocess, "spawn");
+				ctx.jobs.start = () => {
+					throw new Error("registration refused");
+				};
+			}),
+		).rejects.toThrow("registration refused");
+		expect(spawn).not.toHaveBeenCalled();
+	});
+});
 
 describe("spawn compact results", () => {
 	it.each([
@@ -404,7 +456,7 @@ describe("spawn tool routes argv to the subprocess", () => {
 		expect(spawned.cwd).toBe("/tmp");
 	});
 
-	it('confines argv through ctx.get("sandbox") when the executor sandboxes', async () => {
+	it("confines argv through ctx.sandbox under the resolved policy", async () => {
 		const calls = await capturedConfinedSpawn("node", ["--version"]);
 		expect(calls.confine[0].argv).toEqual(["/resolved/node", "--version"]);
 		expect(calls.spawn[0].argv).toEqual([
