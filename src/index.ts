@@ -203,9 +203,13 @@ function processSources(proc: () => ShellExecution | undefined) {
 		channel,
 		read: (fromByte: number) => {
 			const live = proc();
-			return live === undefined
-				? { text: "", nextOffset: fromByte, lossy: false }
-				: live.observed[channel].readFrom(fromByte);
+			return (
+				live?.observed[channel].readFrom(fromByte) ?? {
+					text: "",
+					nextOffset: fromByte,
+					lossy: false,
+				}
+			);
 		},
 	});
 	return [source("stdout"), source("stderr")];
@@ -398,8 +402,7 @@ function canonicalRunResult(
 		...(result.timedOut || result.aborted
 			? { timeoutMs: result.timeoutMs }
 			: {}),
-		...(sandbox !== undefined &&
-		(sandbox.denied || sandbox.runnerFailed === true)
+		...(sandbox?.denied || sandbox?.runnerFailed === true
 			? {
 					sandbox: {
 						mode: sandbox.mode,

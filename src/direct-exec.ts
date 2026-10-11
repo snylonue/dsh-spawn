@@ -155,7 +155,7 @@ export async function runProgram(
 	try {
 		if (!preparationTimedOut) {
 			running = ctx.subprocess.spawn({
-				argv: confined !== undefined ? confined.argv : argv,
+				argv: confined?.argv ?? argv,
 				cwd: spec.workdir,
 				stdio: {
 					stdin: spec.stdin !== undefined ? { data: spec.stdin } : "ignore",
@@ -197,9 +197,7 @@ export async function runProgram(
 
 	const spawned: Promise<SubprocessOutcome> = preparationTimedOut
 		? Promise.resolve({ exitCode: null, signal: null })
-		: running !== undefined
-			? running.done
-			: Promise.reject(syncError);
+		: (running?.done ?? Promise.reject(syncError));
 
 	let providerFailure: { error: unknown; note: string } | undefined;
 	let providerFailureReported = false;
@@ -242,13 +240,14 @@ export async function runProgram(
 		}
 		const runnerFailed = providerRejected
 			? isRunnerSpawnFailure(providerError, confined?.argv[0], spec.workdir)
-			: confined !== undefined &&
-				classifyRunnerFailure(exitCode, stderr, confined.runnerFailureRules) !==
-					undefined;
+			: classifyRunnerFailure(
+					exitCode,
+					stderr,
+					confined?.runnerFailureRules ?? [],
+				) !== undefined;
 		const denied =
 			!runnerFailed &&
-			confined !== undefined &&
-			matchesSignature(exitCode, stderr, confined.denialSignatures);
+			matchesSignature(exitCode, stderr, confined?.denialSignatures ?? []);
 		target.sandbox = {
 			mode: confinedPolicy.mode,
 			denied,
@@ -347,8 +346,7 @@ export async function runProgram(
 		result: () => {
 			resultPromise ??= proc.done.then((): ShellRunResult => {
 				if (providerFailure !== undefined) {
-					if (effectiveSignal?.aborted === true)
-						effectiveSignal.throwIfAborted();
+					effectiveSignal?.throwIfAborted();
 					if (
 						confinedPolicy !== undefined &&
 						confined !== undefined &&
@@ -374,14 +372,11 @@ export async function runProgram(
 					stderr: finalOutput(collected.stderr),
 				};
 				if (confinedPolicy !== undefined) {
-					const runnerFailure =
-						confined !== undefined
-							? classifyRunnerFailure(
-									base.exitCode,
-									base.stderr.text,
-									confined.runnerFailureRules,
-								)
-							: undefined;
+					const runnerFailure = classifyRunnerFailure(
+						base.exitCode,
+						base.stderr.text,
+						confined?.runnerFailureRules ?? [],
+					);
 					if (runnerFailure !== undefined)
 						throw new SandboxUnavailableError(
 							confinedPolicy.mode,
@@ -391,13 +386,11 @@ export async function runProgram(
 						...base,
 						sandbox: {
 							mode: confinedPolicy.mode,
-							denied:
-								confined !== undefined &&
-								matchesSignature(
-									base.exitCode,
-									base.stderr.text,
-									confined.denialSignatures,
-								),
+							denied: matchesSignature(
+								base.exitCode,
+								base.stderr.text,
+								confined?.denialSignatures ?? [],
+							),
 							...(confined !== undefined
 								? { enforcement: confined.enforcement }
 								: {}),
