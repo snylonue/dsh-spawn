@@ -11,7 +11,6 @@
  *
  * @module dsh-spawn/direct-exec
  */
-import { Buffer } from "node:buffer";
 import type { Context } from "@deepseek-ai/cordis";
 import {
 	SandboxUnavailableError,
@@ -24,11 +23,10 @@ import {
 import type {
 	CollectedOutput,
 	SubprocessHandle,
-	SubprocessOutcome,
 	SubprocessOutputReader,
 } from "@deepseek-ai/dsh-subprocess";
 import type {
-	ShellExecution,
+	ShellSandboxInfo,
 	ShellExecSpec,
 	ShellRunResult,
 } from "@deepseek-ai/dsh-shell";
@@ -43,10 +41,14 @@ const DEFAULT_GRACE_MS = 3_000;
 /** Per-stream spill cap; mirrors `dsh-bash-local`/`dsh-pwsh-local`. */
 const DEFAULT_MAX_SPILL_BYTES = 64 * 1024 * 1024;
 
-/** The reader a process that failed before spawn exposes as both streams. */
-const EMPTY_READER: SubprocessOutputReader = {
-	readFrom: () => ({ text: "", lossy: false, nextOffset: 0 }),
-};
+/** Internal process handle consumed by the job adapter and foreground waiter. */
+export interface ProgramExecution {
+	observed: { stdout: SubprocessOutputReader; stderr: SubprocessOutputReader };
+	sandbox?: ShellSandboxInfo;
+	kill(): void;
+	/** One shared result; infrastructure failures reject for both foreground and jobs. */
+	result: Promise<ShellRunResult>;
+}
 
 /** Project a settled collect-mode reader into the final `CollectedOutput` shape. */
 function finalOutput(reader: SubprocessOutputReader): CollectedOutput {
@@ -94,19 +96,19 @@ async function prepareSandbox(
 
 /**
  * Spawn one argv vector under this process's sandbox policy and adapt the
- * provider handle to the shell execution shape the tool's job plumbing uses.
+ * provider handle to the output, cancellation, and result interfaces the tool uses.
  * @param ctx - the plugin context (needs `ctx.subprocess` and `ctx.sandbox`).
  * @param spec - resolved output budgets/policy, from `ctx.shell.resolve` with `onExpiry: "none"`.
  * @param argv - the exact program argv; `argv[0]` is already an executable path.
  * @param signal - the caller's cancellation; overrides `spec.signal` when given.
- * @returns a live `ShellExecution`-shaped handle.
+ * @returns a live process handle with one shared result promise.
  */
 export async function runProgram(
 	ctx: Context,
 	spec: ShellExecSpec,
 	argv: readonly string[],
 	signal: AbortSignal | undefined,
-): Promise<ShellExecution> {
+): Promise<ProgramExecution> {
 	const policy = spec.sandboxPolicy;
 	const confinedPolicy = confinedPolicyOf(spec);
 	const spawnSignal = signal ?? spec.signal;
@@ -117,9 +119,21 @@ export async function runProgram(
 		confined = await prepareSandbox(ctx, argv, confinedPolicy, bound);
 	}
 
-	let running: SubprocessHandle | undefined;
-	let syncError: unknown;
+	// Attribute spawn failures to the sandbox runner only when the evidence matches.
+	const spawnFailure = (error: unknown): never => {
+		spawnSignal?.throwIfAborted();
+		if (
+			confinedPolicy !== undefined &&
+			isRunnerSpawnFailure(error, confined?.argv[0], spec.workdir)
+		) {
+			throw new SandboxUnavailableError(confinedPolicy.mode, String(error));
+		}
+		throw error;
+	};
+
+	let running: SubprocessHandle;
 	try {
+		spawnSignal?.throwIfAborted();
 		running = ctx.subprocess.spawn({
 			argv: confined?.argv ?? argv,
 			cwd: spec.workdir,
@@ -139,232 +153,65 @@ export async function runProgram(
 			env: { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv },
 		});
 	} catch (error) {
-		syncError = error;
+		return spawnFailure(error);
 	}
 
-	let collected: {
-		stdout: SubprocessOutputReader;
-		stderr: SubprocessOutputReader;
-	};
-	if (running !== undefined) {
-		const streams = running.collected;
-		/* v8 ignore start -- the provider exposes both readers for a requested collect stream; defensive. */
-		if (streams.stdout === undefined || streams.stderr === undefined) {
-			throw new Error(
-				"dsh-spawn: the subprocess provider dropped a requested collect stream",
-			);
-		}
-		/* v8 ignore stop */
-		collected = { stdout: streams.stdout, stderr: streams.stderr };
-	} else {
-		collected = { stdout: EMPTY_READER, stderr: EMPTY_READER };
+	const { stdout, stderr } = running.collected;
+	if (stdout === undefined || stderr === undefined) {
+		throw new Error(
+			"dsh-spawn: the subprocess provider dropped a requested collect stream",
+		);
 	}
 
-	const spawned: Promise<SubprocessOutcome> =
-		running?.done ?? Promise.reject(syncError);
-
-	let providerFailure: { error: unknown; note: string } | undefined;
-	let providerFailureReported = false;
-	const consumeProviderFailure = () => {
-		if (providerFailure === undefined || providerFailureReported) return "";
-		providerFailureReported = true;
-		return providerFailure.note;
-	};
-	const observedStderr: SubprocessOutputReader = {
-		readFrom: (fromByte) => {
-			if (providerFailure === undefined)
-				return collected.stderr.readFrom(fromByte);
-			const note = Buffer.from(providerFailure.note, "utf8");
-			return {
-				text: note.subarray(Math.min(fromByte, note.length)).toString("utf8"),
-				nextOffset: note.length,
-				lossy: false,
-			};
-		},
-	};
-
-	/**
-	 * Stamp settlement facts, mirroring the sandbox shell executor: a runner
-	 * that failed before the command could run reports `runnerFailed`, a
-	 * non-zero exit whose stderr matches the backend's denial dialect reports
-	 * `denied`, and an unconfined run under a sandboxing composition reports the
-	 * mode with no denial.
-	 */
-	const settleSandbox = (
-		target: ShellExecution,
-		exitCode: number | null,
-		stderr: string,
-		providerRejected: boolean,
-		providerError: unknown,
-	): void => {
-		if (confinedPolicy === undefined) {
-			if (policy !== undefined)
-				target.sandbox = { mode: policy.mode, denied: false };
-			return;
-		}
-		const runnerFailed = providerRejected
-			? isRunnerSpawnFailure(providerError, confined?.argv[0], spec.workdir)
-			: classifyRunnerFailure(
-					exitCode,
-					stderr,
-					confined?.runnerFailureRules ?? [],
-				) !== undefined;
-		const denied =
-			!runnerFailed &&
-			matchesSignature(exitCode, stderr, confined?.denialSignatures ?? []);
-		target.sandbox = {
-			mode: confinedPolicy.mode,
-			denied,
-			...(confined !== undefined ? { enforcement: confined.enforcement } : {}),
-			...(runnerFailed ? { runnerFailed: true } : {}),
-		};
-	};
-
-	let stdoutOffset = 0;
-	let stderrOffset = 0;
-	let resultPromise: Promise<ShellRunResult> | undefined;
-	const proc: ShellExecution = {
-		status: "running",
-		exitCode: null,
-		signal: null,
-		observed: { stdout: collected.stdout, stderr: observedStderr },
-		done: spawned.then(
-			(outcome) => {
-				if (proc.status === "running") {
-					proc.status =
-						spawnSignal?.aborted === true || outcome.signal !== null
-							? "killed"
-							: "completed";
-				}
-				proc.exitCode = outcome.exitCode;
-				proc.signal = outcome.signal;
-				settleSandbox(
-					proc,
-					outcome.exitCode,
-					collected.stderr.readFrom(0).text,
-					false,
-					undefined,
-				);
-			},
-			(error) => {
-				if (
-					running !== undefined &&
-					(proc.status === "killed" || spawnSignal?.aborted === true)
-				) {
-					proc.status = "killed";
-					settleSandbox(
-						proc,
-						null,
-						collected.stderr.readFrom(0).text,
-						false,
-						undefined,
-					);
-					return;
-				}
-				proc.status = "killed";
-				let detail = "unprintable provider failure";
-				try {
-					detail = String(error);
-				} catch {}
-				providerFailure = {
-					error,
-					note: `subprocess failed before reporting an outcome: ${detail}`,
-				};
-				settleSandbox(proc, null, providerFailure.note, true, error);
-			},
-		),
-		readOutput: () => {
-			const out = collected.stdout.readFrom(stdoutOffset);
-			const err = collected.stderr.readFrom(stderrOffset);
-			stdoutOffset = out.nextOffset;
-			stderrOffset = err.nextOffset;
-			const failure = consumeProviderFailure();
-			const failureSeparator =
-				err.text.length > 0 && !err.text.endsWith("\n") ? "\n" : "";
-			const errText =
-				err.text + (failure.length > 0 ? `${failureSeparator}${failure}` : "");
-			const separator =
-				out.text.length > 0 && !out.text.endsWith("\n") ? "\n" : "";
-			return {
-				delta:
-					out.text +
-					(errText.length > 0 ? `${separator}[stderr]\n${errText}` : ""),
-				lossy: out.lossy || err.lossy,
-				...(out.spillPath !== undefined
-					? { stdoutSpillPath: out.spillPath }
-					: {}),
-				...(err.spillPath !== undefined
-					? { stderrSpillPath: err.spillPath }
-					: {}),
-			};
-		},
-		kill: () => {
-			if (proc.status !== "running") return false;
-			proc.status = "killed";
-			running?.terminate();
-			return true;
-		},
-		result: () => {
-			resultPromise ??= proc.done.then((): ShellRunResult => {
-				if (providerFailure !== undefined) {
-					spawnSignal?.throwIfAborted();
-					if (
-						confinedPolicy !== undefined &&
-						confined !== undefined &&
-						isRunnerSpawnFailure(
-							providerFailure.error,
-							confined.argv[0],
-							spec.workdir,
-						)
-					) {
-						throw new SandboxUnavailableError(
-							confinedPolicy.mode,
-							String(providerFailure.error),
-						);
-					}
-					throw providerFailure.error;
-				}
-				const base: ShellRunResult = {
-					exitCode: proc.exitCode,
-					signal: proc.signal,
+	const proc: ProgramExecution = {
+		observed: { stdout, stderr },
+		kill: () => running.terminate(),
+		result: running.done
+			.catch((error) => {
+				// Cancellation may reject instead of returning exit facts.
+				if (spawnSignal?.aborted) return { exitCode: null, signal: null };
+				return spawnFailure(error);
+			})
+			.then((outcome): ShellRunResult => {
+				const result: ShellRunResult = {
+					...outcome,
 					timedOut: false,
 					aborted: spawnSignal?.aborted === true,
 					timeoutMs: spec.timeoutMs,
-					stdout: finalOutput(collected.stdout),
-					stderr: finalOutput(collected.stderr),
+					stdout: finalOutput(stdout),
+					stderr: finalOutput(stderr),
 				};
 				if (confinedPolicy !== undefined) {
 					const runnerFailure = classifyRunnerFailure(
-						base.exitCode,
-						base.stderr.text,
+						result.exitCode,
+						result.stderr.text,
 						confined?.runnerFailureRules ?? [],
 					);
-					if (runnerFailure !== undefined)
+					if (runnerFailure !== undefined) {
 						throw new SandboxUnavailableError(
 							confinedPolicy.mode,
 							runnerFailure.detail,
 						);
-					return {
-						...base,
-						sandbox: {
-							mode: confinedPolicy.mode,
-							denied: matchesSignature(
-								base.exitCode,
-								base.stderr.text,
-								confined?.denialSignatures ?? [],
-							),
-							...(confined !== undefined
-								? { enforcement: confined.enforcement }
-								: {}),
-						},
+					}
+					proc.sandbox = {
+						mode: confinedPolicy.mode,
+						denied: matchesSignature(
+							result.exitCode,
+							result.stderr.text,
+							confined?.denialSignatures ?? [],
+						),
+						...(confined !== undefined
+							? { enforcement: confined.enforcement }
+							: {}),
 					};
+				} else if (policy !== undefined) {
+					proc.sandbox = { mode: policy.mode, denied: false };
 				}
-				return policy !== undefined
-					? { ...base, sandbox: { mode: policy.mode, denied: false } }
-					: base;
-			});
-			return resultPromise;
-		},
+				return {
+					...result,
+					...(proc.sandbox !== undefined ? { sandbox: proc.sandbox } : {}),
+				};
+			}),
 	};
 	return proc;
 }

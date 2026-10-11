@@ -96,7 +96,7 @@ describe("direct argv execution", () => {
 			["/usr/bin/node", "--version"],
 			undefined,
 		);
-		const result = await proc.result();
+		const result = await proc.result;
 		expect(calls.confine).toHaveLength(0);
 		expect(calls.spawn[0].argv).toEqual(["/usr/bin/node", "--version"]);
 		expect(result).toMatchObject({
@@ -125,7 +125,7 @@ describe("direct argv execution", () => {
 				["/usr/bin/node", "--version"],
 				undefined,
 			)
-		).result();
+		).result;
 		expect(calls.confine[0].argv).toEqual(["/usr/bin/node", "--version"]);
 		expect(calls.spawn[0].argv).toEqual(confined.argv);
 		expect(result.sandbox).toEqual({
@@ -187,7 +187,7 @@ describe("direct argv execution", () => {
 				["prog"],
 				undefined,
 			)
-		).result();
+		).result;
 		expect(result.sandbox).toMatchObject({ mode: "read-only", denied: true });
 	});
 
@@ -208,9 +208,57 @@ describe("direct argv execution", () => {
 					["prog"],
 					undefined,
 				)
-			).result(),
+			).result,
 		).rejects.toThrow();
 	});
+
+	it("preserves captured output when the provider fails", async () => {
+		const { runProgram } = await directExec();
+		const pending = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const spawned = {
+			...handle("partial output", "real stderr", 0),
+			done: pending.promise,
+		};
+		const { ctx } = runner(undefined, spawned);
+		const proc = await runProgram(ctx, spec(), ["prog"], undefined);
+		const error = new Error("provider disconnected");
+		const rejected = expect(proc.result).rejects.toBe(error);
+		pending.reject(error);
+		await rejected;
+		expect(proc.observed.stdout.readFrom(0).text).toBe("partial output");
+		expect(proc.observed.stderr.readFrom(0).text).toBe("real stderr");
+	});
+
+	it.each(["throw", "reject"])(
+		"classifies sandbox runner spawn failures (%s)",
+		async (failure) => {
+			const { runProgram } = await directExec();
+			const { ctx } = runner();
+			const error = Object.assign(new Error("spawn runner ENOENT"), {
+				code: "ENOENT",
+				path: "runner",
+				syscall: "spawn runner",
+			});
+			ctx.subprocess.spawn = () => {
+				if (failure === "throw") throw error;
+				return { ...handle("", "", 0), done: Promise.reject(error) };
+			};
+			await expect(
+				(async () => {
+					const proc = await runProgram(
+						ctx,
+						spec({ sandboxPolicy: READ_ONLY }),
+						["prog"],
+						undefined,
+					);
+					return await proc.result;
+				})(),
+			).rejects.toMatchObject({
+				name: "SandboxUnavailableError",
+				code: "SANDBOX_UNAVAILABLE",
+			});
+		},
+	);
 
 	it("reports full access without confining", async () => {
 		const { runProgram } = await directExec();
@@ -224,7 +272,7 @@ describe("direct argv execution", () => {
 				["prog"],
 				undefined,
 			)
-		).result();
+		).result;
 		expect(calls.confine).toHaveLength(0);
 		expect(result.sandbox).toEqual({
 			mode: "danger-full-access",
@@ -376,6 +424,90 @@ async function capturedConfinedSpawn(
 }
 
 describe("spawn jobs", () => {
+	it.each(["throw", "reject"])(
+		"reports provider failures in foreground and background (%s)",
+		async (failure) => {
+			const setup = (ctx: Any) => {
+				ctx.subprocess.spawn = () => {
+					const error = new Error("provider disconnected");
+					if (failure === "throw") throw error;
+					return {
+						...handle("partial", "stderr", 0),
+						done: Promise.reject(error),
+					};
+				};
+			};
+			await expect(
+				capturedSpawn("node", [], undefined, {}, setup),
+			).rejects.toThrow("provider disconnected");
+			const { jobs, result } = await capturedSpawn(
+				"node",
+				[],
+				undefined,
+				{ background: true },
+				setup,
+			);
+			expect(await jobs.wait(result.jobId, 1000)).toEqual({
+				status: "failed",
+				detail: "provider disconnected",
+			});
+		},
+	);
+
+	it("reports sandbox runner failures as failed jobs", async () => {
+		const { jobs, result } = await capturedSpawn(
+			"node",
+			[],
+			handle("", "runner exploded", 3),
+			{ background: true },
+			(ctx) => {
+				ctx.sandboxPolicy.resolve = () => READ_ONLY;
+				ctx.sandbox.confine = async (argv: string[]) => ({
+					argv: ["runner", ...argv],
+					enforcement: "full",
+					denialSignatures: [],
+					runnerFailureRules: [{ fatalSignatures: ["runner exploded"] }],
+				});
+			},
+		);
+		expect(await jobs.wait(result.jobId, 1000)).toMatchObject({
+			status: "failed",
+			detail: expect.stringContaining("runner exploded"),
+		});
+	});
+
+	it.each([
+		[3, null, "completed", "exit code: 3"],
+		[0, "SIGTERM", "killed", "signal: SIGTERM"],
+	])(
+		"retains command exit facts in background jobs (%s, %s)",
+		async (exitCode, signal, status, detail) => {
+			const { jobs, result } = await capturedSpawn(
+				"node",
+				[],
+				handle("", "", exitCode as number, signal as string | null),
+				{ background: true },
+			);
+			expect(await jobs.wait(result.jobId, 1000)).toEqual({ status, detail });
+		},
+	);
+
+	it("keeps cancelled jobs killed when the provider rejects", async () => {
+		const pending = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const process = {
+			...handle("partial", "", 0),
+			done: pending.promise,
+			terminate: () => pending.reject(new Error("terminated")),
+		};
+		const { jobs, result } = await capturedSpawn("node", [], process, {
+			background: true,
+		});
+		jobs.kill(result.jobId, undefined, "user stopped");
+		expect(await jobs.wait(result.jobId, 1000)).toMatchObject({
+			status: "killed",
+		});
+	});
+
 	it("cancels unfinished sandbox preparation when the job wait times out", async () => {
 		let spawn: Any;
 		let kill: Any;

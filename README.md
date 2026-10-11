@@ -2,7 +2,7 @@
 
 Provides a `spawn` tool that executes a command directly without shell, and independently configurable `stat` and `list_dir` tool plugins.
 
-`spawn` requires the `jobs`, `sandbox`, and `sandboxPolicy` services. Every invocation starts a job; foreground calls wait for completion and move the job to the background on timeout.
+`spawn` requires the `jobs`, `sandbox`, and `sandboxPolicy` services. Every invocation starts a job; foreground calls wait for completion and move the job to the background on timeout. Infrastructure failures throw in foreground calls and settle background jobs as `failed`; nonzero command exits remain ordinary results.
 
 The `dsh-spawn` entry registers only `spawn`. Load `dsh-spawn/stat` and `dsh-spawn/list-dir` separately for filesystem queries. The `PTC-spawn` preset enables all three by default. To disable either query tool in that preset, set `disabled: true` on its entry under `preset-ptc-spawn.config.plugins`:
 

@@ -43,7 +43,6 @@ import {
 	DSH_ENV_PREFIX,
 	type CollectedOutput,
 	type ShellExecSpec,
-	type ShellExecution,
 	type ShellRunResult,
 	type ShellSandboxInfo,
 } from "@deepseek-ai/dsh-shell";
@@ -54,7 +53,7 @@ import type {
 	JobView,
 } from "@deepseek-ai/dsh-jobs";
 import type { Context } from "@deepseek-ai/cordis";
-import { runProgram } from "./direct-exec.js";
+import { runProgram, type ProgramExecution } from "./direct-exec.js";
 // The empty type-only imports pull in each host package's Cordis `Context`
 // augmentation (`ctx.sandboxPolicy`, `ctx.subprocess`, `ctx.shellEnv`,
 // `ctx.systemPrompt`) without adding any of them to the runtime import graph.
@@ -122,7 +121,7 @@ declare module "@deepseek-ai/dsh-jobs" {
 /** One registered background job, as `startJob` hands it to the waiter. */
 interface AttachedJob {
 	id: JobId;
-	process(): ShellExecution | undefined;
+	process(): ProgramExecution | undefined;
 	stopped(): string | undefined;
 }
 
@@ -156,7 +155,7 @@ function displayCommand(command: string, args: string[] | undefined): string {
 	return [command, ...(args ?? [])].join(" ");
 }
 
-// ── job adaptation (same semantics as @deepseek-ai/dsh-tool-bash) ───────────
+// ── job adaptation ──────────────────────────────────────────────────────────
 
 /**
  * Sandbox facts worth the terminal detail: a runner that never ran the
@@ -177,28 +176,28 @@ function sandboxNotes(sandbox: ShellSandboxInfo | undefined): string[] {
 }
 
 /** Map a settled background process onto the generic job-outcome vocabulary. */
-function processOutcome(proc: ShellExecution): JobOutcome {
+function processOutcome(result: ShellRunResult): JobOutcome {
 	const base: JobOutcome =
-		proc.status === "killed"
+		result.aborted || result.signal !== null
 			? {
 					status: "killed",
 					detail:
-						proc.signal !== null
-							? `signal: ${proc.signal}`
+						result.signal !== null
+							? `signal: ${result.signal}`
 							: "killed before exit",
 				}
 			: {
 					status: "completed",
-					detail: `exit code: ${proc.exitCode ?? 0}`,
+					detail: `exit code: ${result.exitCode ?? 0}`,
 				};
-	const notes = sandboxNotes(proc.sandbox);
+	const notes = sandboxNotes(result.sandbox);
 	return notes.length === 0
 		? base
 		: { ...base, detail: `${base.detail}; ${notes.join(" ")}` };
 }
 
 /** The process's non-consuming stream readers as registry pull sources. */
-function processSources(proc: () => ShellExecution | undefined) {
+function processSources(proc: () => ProgramExecution | undefined) {
 	const source = (channel: "stdout" | "stderr") => ({
 		channel,
 		read: (fromByte: number) => {
@@ -231,13 +230,13 @@ function ringDelta(
 	return out + (err.length > 0 ? `${separator}[stderr]\n${err}` : "");
 }
 
-/** Adapt asynchronous shell preparation after job admission without exposing a partial process. */
+/** Run preparation and execution under job-owned cancellation and classify one result. */
 function processJob(
-	start: (signal: AbortSignal) => Promise<ShellExecution>,
-	outcome: (proc: ShellExecution) => JobOutcome,
+	start: (signal: AbortSignal) => Promise<ProgramExecution>,
+	outcome: (result: ShellRunResult) => JobOutcome,
 ): { cancel(reason: unknown): void; done: Promise<JobOutcome> } {
 	const controller = new AbortController();
-	let process: ShellExecution | undefined;
+	let process: ProgramExecution | undefined;
 	return {
 		cancel: (reason: unknown) => {
 			if (controller.signal.aborted) return;
@@ -247,18 +246,11 @@ function processJob(
 		done: (async () => {
 			try {
 				process = await start(controller.signal);
-				try {
-					if (controller.signal.aborted) process.kill();
-				} finally {
-					await process.done;
-				}
-				return outcome(process);
+				if (controller.signal.aborted) process.kill();
+				return outcome(await process.result);
 			} catch (error) {
 				return {
-					status:
-						controller.signal.aborted && process === undefined
-							? "killed"
-							: "failed",
+					status: controller.signal.aborted ? "killed" : "failed",
 					detail: error instanceof Error ? error.message : String(error),
 				};
 			}
@@ -624,7 +616,7 @@ function spawnTool(ctx: Context): ToolDefinition {
 		spec: ShellExecSpec,
 		argv: readonly string[],
 	): AttachedJob => {
-		let proc: ShellExecution;
+		let proc: ProgramExecution;
 		let stopped: string | undefined;
 		return {
 			id: registry.start({
@@ -703,7 +695,7 @@ function spawnTool(ctx: Context): ToolDefinition {
 		registry.remove(attached.id, owner);
 		const process = attached.process();
 		if (process === undefined) throw new Error(view.detail);
-		const result = await process.result();
+		const result = await process.result;
 		const stopped = attached.stopped();
 		return {
 			kind: "foreground",
