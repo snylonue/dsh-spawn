@@ -1,9 +1,9 @@
 import { Context } from "@deepseek-ai/cordis";
 import ToolRuntime from "@deepseek-ai/dsh-tools";
 import { describe, expect, it } from "vitest";
-import * as spawnPlugin from "dsh-spawn";
-import * as statPlugin from "dsh-spawn/stat";
-import * as listDirPlugin from "dsh-spawn/list-dir";
+import * as spawnPlugin from "@snylonue/dsh-spawn";
+import * as statPlugin from "@snylonue/dsh-spawn/stat";
+import * as listDirPlugin from "@snylonue/dsh-spawn/list-dir";
 
 async function setup() {
 	const ctx = new Context();

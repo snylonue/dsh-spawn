@@ -2,13 +2,13 @@
 # `tool-bash` replaced by this bundle's typed argv API.
 - insert:
     - id: spawn
-      name: 'dsh-spawn'
+      name: '@snylonue/dsh-spawn'
       disabled: true
     - id: tool-stat
-      name: 'dsh-spawn/stat'
+      name: '@snylonue/dsh-spawn/stat'
       disabled: true
     - id: tool-list-dir
-      name: 'dsh-spawn/list-dir'
+      name: '@snylonue/dsh-spawn/list-dir'
       disabled: true
     - id: preset-ptc-spawn
       name: '@deepseek-ai/dsh-agent-preset'
@@ -27,11 +27,11 @@
             config:
               maxBytes: 65536
           - id: spawn
-            name: 'dsh-spawn'
+            name: '@snylonue/dsh-spawn'
           - id: tool-stat
-            name: 'dsh-spawn/stat'
+            name: '@snylonue/dsh-spawn/stat'
           - id: tool-list-dir
-            name: 'dsh-spawn/list-dir'
+            name: '@snylonue/dsh-spawn/list-dir'
           - id: tool-fs
             name: '@deepseek-ai/dsh-tool-fs'
           - id: tool-fs-search

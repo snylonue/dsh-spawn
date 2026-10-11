@@ -1,0 +1,6 @@
+{
+	"meta": {
+		"title": "Spawn",
+		"description": "A tool call to run programs directly by argv without a shell, with optional file metadata and directory tools."
+	}
+}

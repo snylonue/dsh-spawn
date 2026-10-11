@@ -1,10 +1,17 @@
 {
-	"name": "dsh-spawn",
+	"name": "@snylonue/dsh-spawn",
 	"version": "1.0.0",
-	"private": true,
-	"description": "A tool to enable bashless dsh",
+	"description": "A tool call for direct argv execution and optional filesystem query tools for DeepSeek Harness",
 	"type": "module",
 	"license": "MIT",
+	"keywords": [
+		"dsh-plugin"
+	],
+	"repository": "github:snylonue/dsh-spawn",
+	"packageManager": "pnpm@12.3.4",
+	"publishConfig": {
+		"access": "public"
+	},
 	"engines": {
 		"dsh": "^0.2.0-rc.2"
 	},
@@ -23,11 +30,13 @@
 			"default": "./dist/list-dir.js"
 		},
 		"./cordis.patch.yml": "./cordis.patch.yml",
+		"./locale/*.json": "./locale/*.json",
 		"./package.json": "./package.json"
 	},
 	"files": [
 		"dist",
 		"cordis.patch.yml",
+		"locale/*.json",
 		"README.md",
 		"LICENSE"
 	],
@@ -40,6 +49,7 @@
 	"scripts": {
 		"build": "tsc -p tsconfig.json",
 		"prepare": "tsc -p tsconfig.json",
+		"prepack": "pnpm run build",
 		"typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
 		"test": "pnpm build && vitest run",
 		"test:watch": "vitest",
@@ -47,6 +57,10 @@
 		"lint": "biome lint ."
 	},
 	"peerDependencies": {
+		"@deepseek-ai/cordis": "~4.0.4",
+		"@deepseek-ai/dsh-fs": "^0.2.0-rc.2",
+		"@deepseek-ai/dsh-shell-env": "^0.2.0-rc.2",
+		"@deepseek-ai/dsh-system-prompt": "^0.2.0-rc.2",
 		"@deepseek-ai/dsh-jobs": "^0.2.0-rc.2",
 		"@deepseek-ai/dsh-llm": "^0.2.0-rc.2",
 		"@deepseek-ai/dsh-sandbox": "^0.2.0-rc.2",
@@ -89,6 +103,6 @@
 	},
 	"meta": {
 		"title": "Spawn",
-		"description": "Run a program by argv — never a shell."
+		"description": "A tool call to run programs directly by argv without a shell, with optional file metadata and directory tools."
 	}
 }

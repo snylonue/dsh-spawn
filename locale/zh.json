@@ -1,0 +1,6 @@
+{
+	"meta": {
+		"title": "Spawn",
+		"description": "不经 shell 直接运行程序的 tool call，以及可单独启用的 stat 和 ls。"
+	}
+}
