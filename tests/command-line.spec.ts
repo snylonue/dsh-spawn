@@ -135,6 +135,57 @@ describe("direct argv execution", () => {
 		});
 	});
 
+	it("stops waiting when sandbox preparation ignores cancellation", async () => {
+		const { runProgram } = await directExec();
+		const { ctx, calls } = runner();
+		ctx.sandbox.confine = () => new Promise(() => {});
+		const controller = new AbortController();
+		const reason = new Error("cancelled during preparation");
+		const pending = runProgram(
+			ctx,
+			spec({ sandboxPolicy: READ_ONLY }),
+			["prog"],
+			controller.signal,
+		);
+		controller.abort(reason);
+		await expect(pending).rejects.toBe(reason);
+		expect(calls.spawn).toHaveLength(0);
+	});
+
+	it("reports a timeout when sandbox preparation does not finish", async () => {
+		const { runProgram } = await directExec();
+		const { ctx, calls } = runner();
+		ctx.sandbox.confine = () => new Promise(() => {});
+		const proc = await runProgram(
+			ctx,
+			spec({ sandboxPolicy: READ_ONLY, onExpiry: "kill", timeoutMs: 1 }),
+			["prog"],
+			undefined,
+		);
+		expect(await proc.result()).toMatchObject({
+			timedOut: true,
+			aborted: false,
+			exitCode: null,
+		});
+		expect(calls.spawn).toHaveLength(0);
+	});
+
+	it("does not prepare or spawn after cancellation", async () => {
+		const { runProgram } = await directExec();
+		const { ctx, calls } = runner();
+		const reason = new Error("already cancelled");
+		await expect(
+			runProgram(
+				ctx,
+				spec({ sandboxPolicy: READ_ONLY }),
+				["prog"],
+				AbortSignal.abort(reason),
+			),
+		).rejects.toBe(reason);
+		expect(calls.confine).toHaveLength(0);
+		expect(calls.spawn).toHaveLength(0);
+	});
+
 	it("marks a matching non-zero exit as a sandbox denial", async () => {
 		const { runProgram } = await directExec();
 		const confined = {

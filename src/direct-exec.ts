@@ -69,6 +69,32 @@ function confinedPolicyOf(spec: ShellExecSpec): SandboxPolicy | undefined {
 	return { ...policy, mode: policy.mode };
 }
 
+/** Prepare sandbox argv, stopping the wait even if the provider ignores cancellation. */
+async function prepareSandbox(
+	ctx: Context,
+	argv: readonly string[],
+	policy: SandboxPolicy,
+	signal: AbortSignal,
+): Promise<ConfinedArgv> {
+	signal.throwIfAborted();
+
+	const { promise: cancelled, reject } = Promise.withResolvers<never>();
+	const cancel = () => reject(signal.reason);
+	signal.addEventListener("abort", cancel, { once: true });
+	async function prepare(): Promise<ConfinedArgv> {
+		signal.throwIfAborted();
+		return await ctx.sandbox.confine(argv, policy, signal);
+	}
+
+	try {
+		const confined = await Promise.race([prepare(), cancelled]);
+		signal.throwIfAborted();
+		return confined;
+	} finally {
+		signal.removeEventListener("abort", cancel);
+	}
+}
+
 /**
  * Spawn one argv vector under this process's sandbox policy and adapt the
  * provider handle to the shell execution shape the tool's job plumbing uses.
@@ -113,29 +139,14 @@ export async function runProgram(
 	let preparationTimedOut = false;
 	if (confinedPolicy !== undefined) {
 		const bound = spawnSignal ?? new AbortController().signal;
-		let rejectCancelled: (reason?: unknown) => void = () => {};
-		const cancelled = new Promise<never>((_resolve, reject) => {
-			rejectCancelled = reject;
-		});
-		const cancel = () => rejectCancelled(bound.reason);
-		bound.addEventListener("abort", cancel, { once: true });
 		try {
-			confined = await Promise.race([
-				Promise.resolve().then(() => {
-					bound.throwIfAborted();
-					return ctx.sandbox.confine(argv, confinedPolicy, bound);
-				}),
-				cancelled,
-			]);
-			bound.throwIfAborted();
+			confined = await prepareSandbox(ctx, argv, confinedPolicy, bound);
 		} catch (error) {
 			if (!classify().timedOut) {
 				disarm();
 				throw error;
 			}
 			preparationTimedOut = true;
-		} finally {
-			bound.removeEventListener("abort", cancel);
 		}
 	}
 
