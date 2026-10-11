@@ -1,8 +1,8 @@
 /**
  * Direct argv execution for `dsh-spawn`: spawn the program through
  * `ctx.subprocess` (`argv`, never a shell string) under `ctx.sandbox`
- * confinement, with the shell executors' deadline, output-collection, spill,
- * and sandbox-fact semantics but no shell layer.
+ * confinement, with output-collection, spill, and sandbox-fact semantics but
+ * no shell layer. The job registry owns waiting deadlines and promotion.
  *
  * This is the seam that makes the tool's "no shell" contract real: every
  * platform spawns from an argv vector, so the platform's own command-line
@@ -27,7 +27,6 @@ import type {
 	SubprocessOutcome,
 	SubprocessOutputReader,
 } from "@deepseek-ai/dsh-subprocess";
-import { deadline, timeoutOf } from "@deepseek-ai/dsh-timeout";
 import type {
 	ShellExecution,
 	ShellExecSpec,
@@ -43,8 +42,6 @@ const ENV_OVERRIDES: Record<string, string> =
 const DEFAULT_GRACE_MS = 3_000;
 /** Per-stream spill cap; mirrors `dsh-bash-local`/`dsh-pwsh-local`. */
 const DEFAULT_MAX_SPILL_BYTES = 64 * 1024 * 1024;
-/** Timeout reason code this runner owns (the executors' `BASH_TIMEOUT` twin). */
-const SPAWN_TIMEOUT = "SPAWN_TIMEOUT";
 
 /** The reader a process that failed before spawn exposes as both streams. */
 const EMPTY_READER: SubprocessOutputReader = {
@@ -99,7 +96,7 @@ async function prepareSandbox(
  * Spawn one argv vector under this process's sandbox policy and adapt the
  * provider handle to the shell execution shape the tool's job plumbing uses.
  * @param ctx - the plugin context (needs `ctx.subprocess` and `ctx.sandbox`).
- * @param spec - resolved budgets/policy, from `ctx.shell.resolve`.
+ * @param spec - resolved output budgets/policy, from `ctx.shell.resolve` with `onExpiry: "none"`.
  * @param argv - the exact program argv; `argv[0]` is already an executable path.
  * @param signal - the caller's cancellation; overrides `spec.signal` when given.
  * @returns a live `ShellExecution`-shaped handle.
@@ -112,67 +109,35 @@ export async function runProgram(
 ): Promise<ShellExecution> {
 	const policy = spec.sandboxPolicy;
 	const confinedPolicy = confinedPolicyOf(spec);
-	const effectiveSignal = signal ?? spec.signal;
-
-	let spawnSignal: AbortSignal | undefined;
-	let classify: () => { timedOut: boolean; aborted: boolean };
-	let disarm = () => {};
-	if (spec.onExpiry === "kill") {
-		const d = deadline(effectiveSignal, spec.timeoutMs, SPAWN_TIMEOUT);
-		spawnSignal = d.signal;
-		classify = () => {
-			const timedOut = timeoutOf(d.signal, SPAWN_TIMEOUT) !== undefined;
-			return { timedOut, aborted: d.signal.aborted && !timedOut };
-		};
-		disarm = () => {
-			d[Symbol.dispose]();
-		};
-	} else {
-		spawnSignal = effectiveSignal;
-		classify = () => ({
-			timedOut: false,
-			aborted: effectiveSignal?.aborted === true,
-		});
-	}
+	const spawnSignal = signal ?? spec.signal;
 
 	let confined: ConfinedArgv | undefined;
-	let preparationTimedOut = false;
 	if (confinedPolicy !== undefined) {
 		const bound = spawnSignal ?? new AbortController().signal;
-		try {
-			confined = await prepareSandbox(ctx, argv, confinedPolicy, bound);
-		} catch (error) {
-			if (!classify().timedOut) {
-				disarm();
-				throw error;
-			}
-			preparationTimedOut = true;
-		}
+		confined = await prepareSandbox(ctx, argv, confinedPolicy, bound);
 	}
 
 	let running: SubprocessHandle | undefined;
 	let syncError: unknown;
 	try {
-		if (!preparationTimedOut) {
-			running = ctx.subprocess.spawn({
-				argv: confined?.argv ?? argv,
-				cwd: spec.workdir,
-				stdio: {
-					stdin: spec.stdin !== undefined ? { data: spec.stdin } : "ignore",
-					stdout: {
-						maxBytes: spec.stdoutMaxBytes,
-						spill: { maxBytes: DEFAULT_MAX_SPILL_BYTES },
-					},
-					stderr: {
-						maxBytes: spec.stdoutMaxBytes,
-						spill: { maxBytes: DEFAULT_MAX_SPILL_BYTES },
-					},
+		running = ctx.subprocess.spawn({
+			argv: confined?.argv ?? argv,
+			cwd: spec.workdir,
+			stdio: {
+				stdin: spec.stdin !== undefined ? { data: spec.stdin } : "ignore",
+				stdout: {
+					maxBytes: spec.stdoutMaxBytes,
+					spill: { maxBytes: DEFAULT_MAX_SPILL_BYTES },
 				},
-				graceMs: DEFAULT_GRACE_MS,
-				signal: spawnSignal,
-				env: { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv },
-			});
-		}
+				stderr: {
+					maxBytes: spec.stdoutMaxBytes,
+					spill: { maxBytes: DEFAULT_MAX_SPILL_BYTES },
+				},
+			},
+			graceMs: DEFAULT_GRACE_MS,
+			signal: spawnSignal,
+			env: { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv },
+		});
 	} catch (error) {
 		syncError = error;
 	}
@@ -195,9 +160,8 @@ export async function runProgram(
 		collected = { stdout: EMPTY_READER, stderr: EMPTY_READER };
 	}
 
-	const spawned: Promise<SubprocessOutcome> = preparationTimedOut
-		? Promise.resolve({ exitCode: null, signal: null })
-		: (running?.done ?? Promise.reject(syncError));
+	const spawned: Promise<SubprocessOutcome> =
+		running?.done ?? Promise.reject(syncError);
 
 	let providerFailure: { error: unknown; note: string } | undefined;
 	let providerFailureReported = false;
@@ -281,7 +245,6 @@ export async function runProgram(
 					false,
 					undefined,
 				);
-				disarm();
 			},
 			(error) => {
 				if (
@@ -296,7 +259,6 @@ export async function runProgram(
 						false,
 						undefined,
 					);
-					disarm();
 					return;
 				}
 				proc.status = "killed";
@@ -309,7 +271,6 @@ export async function runProgram(
 					note: `subprocess failed before reporting an outcome: ${detail}`,
 				};
 				settleSandbox(proc, null, providerFailure.note, true, error);
-				disarm();
 			},
 		),
 		readOutput: () => {
@@ -346,7 +307,7 @@ export async function runProgram(
 		result: () => {
 			resultPromise ??= proc.done.then((): ShellRunResult => {
 				if (providerFailure !== undefined) {
-					effectiveSignal?.throwIfAborted();
+					spawnSignal?.throwIfAborted();
 					if (
 						confinedPolicy !== undefined &&
 						confined !== undefined &&
@@ -366,7 +327,8 @@ export async function runProgram(
 				const base: ShellRunResult = {
 					exitCode: proc.exitCode,
 					signal: proc.signal,
-					...classify(),
+					timedOut: false,
+					aborted: spawnSignal?.aborted === true,
 					timeoutMs: spec.timeoutMs,
 					stdout: finalOutput(collected.stdout),
 					stderr: finalOutput(collected.stderr),

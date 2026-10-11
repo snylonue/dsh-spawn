@@ -152,24 +152,6 @@ describe("direct argv execution", () => {
 		expect(calls.spawn).toHaveLength(0);
 	});
 
-	it("reports a timeout when sandbox preparation does not finish", async () => {
-		const { runProgram } = await directExec();
-		const { ctx, calls } = runner();
-		ctx.sandbox.confine = () => new Promise(() => {});
-		const proc = await runProgram(
-			ctx,
-			spec({ sandboxPolicy: READ_ONLY, onExpiry: "kill", timeoutMs: 1 }),
-			["prog"],
-			undefined,
-		);
-		expect(await proc.result()).toMatchObject({
-			timedOut: true,
-			aborted: false,
-			exitCode: null,
-		});
-		expect(calls.spawn).toHaveLength(0);
-	});
-
 	it("does not prepare or spawn after cancellation", async () => {
 		const { runProgram } = await directExec();
 		const { ctx, calls } = runner();
@@ -284,7 +266,7 @@ async function capturedSpawn(
 			resolve: (request: Any) => ({
 				workdir: "/tmp",
 				timeoutMs: 1000,
-				onExpiry: "kill",
+				onExpiry: "none",
 				stdoutMaxBytes: 4096,
 				sandboxPolicy: undefined,
 				...request,
@@ -360,7 +342,7 @@ async function capturedConfinedSpawn(
 			resolve: (request: Any) => ({
 				workdir: "/tmp",
 				timeoutMs: 1000,
-				onExpiry: "kill",
+				onExpiry: "none",
 				stdoutMaxBytes: 4096,
 				sandboxPolicy: policy,
 				...request,
@@ -394,6 +376,36 @@ async function capturedConfinedSpawn(
 }
 
 describe("spawn jobs", () => {
+	it("cancels unfinished sandbox preparation when the job wait times out", async () => {
+		let spawn: Any;
+		let kill: Any;
+		const { result } = await capturedSpawn(
+			"node",
+			[],
+			handle("", "", 0),
+			{ timeoutMs: 1 },
+			(ctx) => {
+				ctx.sandboxPolicy.resolve = () => READ_ONLY;
+				ctx.sandbox.confine = () => new Promise(() => {});
+				spawn = vi.spyOn(ctx.subprocess, "spawn");
+				kill = vi.spyOn(ctx.jobs, "kill");
+			},
+		);
+		expect(result).toEqual({
+			kind: "foreground",
+			exitCode: null,
+			timedOut: true,
+			timeoutMs: 1,
+			stdout: { text: "" },
+		});
+		expect(kill).toHaveBeenCalledWith(
+			"spawn-1",
+			undefined,
+			"timed out during preparation",
+		);
+		expect(spawn).not.toHaveBeenCalled();
+	});
+
 	it("starts background work without waiting for it", async () => {
 		let wait: Any;
 		const spawned = await capturedSpawn(

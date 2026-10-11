@@ -66,7 +66,7 @@ import type {} from "@deepseek-ai/dsh-system-prompt";
 // ── host packages ────────────────────────────────────────────────────────────
 //
 // `@deepseek-ai/dsh-tools` / `dsh-llm` / `dsh-sandbox` / `dsh-shell` /
-// `dsh-subprocess` / `dsh-timeout` are peer dependencies: the dsh launcher
+// `dsh-subprocess` are peer dependencies: the dsh launcher
 // installs a runtime resolution into Node's ESM and CommonJS resolvers, and
 // this package's peer declarations route each bare request to the module
 // instance the running harness loaded, even when the bundle is a symlink.
