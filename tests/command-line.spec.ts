@@ -176,18 +176,21 @@ describe("direct argv execution", () => {
 			denialSignatures: ["Permission denied"],
 			runnerFailureRules: [],
 		};
-		const { ctx } = runner(
-			confined,
-			handle("", "cat: /x: Permission denied", 1),
+		const pending = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const { ctx } = runner(confined, {
+			...handle("", "cat: /x: Permission denied", 1),
+			done: pending.promise,
+		});
+		const proc = await runProgram(
+			ctx,
+			spec({ sandboxPolicy: READ_ONLY }),
+			["prog"],
+			undefined,
 		);
-		const result = await (
-			await runProgram(
-				ctx,
-				spec({ sandboxPolicy: READ_ONLY }),
-				["prog"],
-				undefined,
-			)
-		).result;
+		// Completion must also work with a frozen live handle.
+		Object.freeze(proc);
+		pending.resolve({ exitCode: 1, signal: null });
+		const result = await proc.result;
 		expect(result.sandbox).toMatchObject({ mode: "read-only", denied: true });
 	});
 

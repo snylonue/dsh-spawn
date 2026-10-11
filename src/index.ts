@@ -341,21 +341,12 @@ function renderJobRead(
 	delta: string,
 	lossy: boolean,
 	spillPaths: readonly string[],
-	sandbox: ShellSandboxInfo | undefined,
 ): string {
 	const notices = [];
 	if (lossy) {
 		notices.push(
 			`[some output was dropped from memory; full output: ${spillPaths.length > 0 ? spillPaths.join(", ") : "(unavailable)"}]`,
 		);
-	}
-	if (sandbox?.runnerFailed) {
-		notices.push(
-			`[sandbox: the sandbox runner itself failed under ${sandbox.mode} mode — the command did not run; this is a sandbox problem, not a command failure]`,
-		);
-	} else if (sandbox?.denied) {
-		notices.push(sandboxDenialMarker(sandbox.mode));
-		notices.push(escalationHintMarker("command"));
 	}
 	if (notices.length === 0) return delta;
 	return `${delta}${delta.length > 0 && !delta.endsWith("\n") ? "\n" : ""}${notices.join("\n")}`;
@@ -688,7 +679,6 @@ function spawnTool(ctx: Context): ToolDefinition {
 					ringDelta(read.chunks),
 					read.lossy,
 					read.job.output.spillPaths ?? [],
-					attached.process()?.sandbox,
 				),
 			};
 		}

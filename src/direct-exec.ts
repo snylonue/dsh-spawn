@@ -44,7 +44,6 @@ const DEFAULT_MAX_SPILL_BYTES = 64 * 1024 * 1024;
 /** Internal process handle consumed by the job adapter and foreground waiter. */
 export interface ProgramExecution {
 	observed: { stdout: SubprocessOutputReader; stderr: SubprocessOutputReader };
-	sandbox?: ShellSandboxInfo;
 	kill(): void;
 	/** One shared result; infrastructure failures reject for both foreground and jobs. */
 	result: Promise<ShellRunResult>;
@@ -163,7 +162,7 @@ export async function runProgram(
 		);
 	}
 
-	const proc: ProgramExecution = {
+	return {
 		observed: { stdout, stderr },
 		kill: () => running.terminate(),
 		result: running.done
@@ -181,6 +180,7 @@ export async function runProgram(
 					stdout: finalOutput(stdout),
 					stderr: finalOutput(stderr),
 				};
+				let sandbox: ShellSandboxInfo | undefined;
 				if (confinedPolicy !== undefined) {
 					const runnerFailure = classifyRunnerFailure(
 						result.exitCode,
@@ -193,7 +193,7 @@ export async function runProgram(
 							runnerFailure.detail,
 						);
 					}
-					proc.sandbox = {
+					sandbox = {
 						mode: confinedPolicy.mode,
 						denied: matchesSignature(
 							result.exitCode,
@@ -205,13 +205,12 @@ export async function runProgram(
 							: {}),
 					};
 				} else if (policy !== undefined) {
-					proc.sandbox = { mode: policy.mode, denied: false };
+					sandbox = { mode: policy.mode, denied: false };
 				}
 				return {
 					...result,
-					...(proc.sandbox !== undefined ? { sandbox: proc.sandbox } : {}),
+					...(sandbox !== undefined ? { sandbox } : {}),
 				};
 			}),
 	};
-	return proc;
 }
