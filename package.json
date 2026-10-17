@@ -1,6 +1,6 @@
 {
 	"name": "@snylonue/dsh-spawn",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"description": "A tool call for direct argv execution and optional filesystem query tools for DeepSeek Harness",
 	"type": "module",
 	"license": "MIT",
