@@ -6,3 +6,7 @@ probe-*.mjs
 /.artifacts
 backup/
 *.bak-*
+
+# Keep pnpm as the only dependency lockfile.
+package-lock.json
+npm-shrinkwrap.json

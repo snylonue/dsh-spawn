@@ -2,12 +2,13 @@
 import { stat as hostStat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
+import type {} from "@deepseek-ai/dsh-fs";
 import {
 	defineTool,
 	type ToolDefinition,
 	type ToolRunContext,
 } from "@deepseek-ai/dsh-tools";
-import type {} from "@deepseek-ai/dsh-fs";
+import type {} from "@deepseek-ai/dsh-working-directory";
 
 /** The `stat` value. */
 interface StatValue {
@@ -50,7 +51,7 @@ function statTool(ctx: Context): ToolDefinition {
 				type: "string",
 				required: true,
 				description:
-					"Path to inspect; a relative path resolves against the session workspace.",
+					"Path to inspect; a relative path resolves against the current session directory.",
 			},
 		},
 		output: {
@@ -77,7 +78,10 @@ function statTool(ctx: Context): ToolDefinition {
 		},
 		isConcurrencySafe: () => true,
 		async execute(args: PathArgs, spawn: ToolRunContext) {
-			const cwd = spawn.agent?.session.header.cwd;
+			const cwd =
+				spawn.agent === undefined
+					? undefined
+					: await ctx.workingDirectory.ensure(spawn.agent, spawn.signal);
 			const target = await ctx.fs.resolve(args.path, {
 				...(cwd !== undefined ? { cwd } : {}),
 				signal: spawn.signal,
@@ -98,7 +102,7 @@ function statTool(ctx: Context): ToolDefinition {
 }
 
 export const name = "tool-stat";
-export const inject = ["tools", "fs"];
+export const inject = ["tools", "fs", "workingDirectory"];
 
 export function apply(ctx: Context): void {
 	ctx.tools.register(statTool(ctx));

@@ -307,6 +307,7 @@ async function capturedSpawn(
 	spawned: Any = handle("ok", "", 0),
 	options: Any = {},
 	setup: (ctx: Any) => void = () => {},
+	run: Any = {},
 ): Promise<Any> {
 	const mod = await plugin();
 	let captured: Any;
@@ -357,6 +358,7 @@ async function capturedSpawn(
 	const result = await captured.execute(input, {
 		signal: new AbortController().signal,
 		callId: "call-1",
+		...run,
 	});
 	return {
 		...calls.spawn[0],
@@ -663,4 +665,106 @@ describe("spawn tool routes argv to the subprocess", () => {
 			"--version",
 		]);
 	});
+});
+
+describe("host-managed session directory", () => {
+	it.each([
+		[undefined, "/ws/current"],
+		["child", "/ws/current/child"],
+		["/elsewhere", "/elsewhere"],
+	])(
+		"resolves cwd %s without moving the sandbox root",
+		async (cwd, expected) => {
+			const agent = { id: "a", session: { header: { cwd: "/ws" } } };
+			const ensure = vi.fn(async () => "/ws/current");
+			const result = await capturedSpawn(
+				"node",
+				[],
+				undefined,
+				cwd === undefined ? {} : { cwd },
+				(ctx) => {
+					ctx.workingDirectory = { ensure };
+					ctx.sandboxPolicy.resolve = () => ({
+						mode: "danger-full-access",
+						workspaceRoot: "/ws",
+					});
+				},
+				{ agent },
+			);
+			expect(result.cwd).toBe(expected);
+			expect(ensure).toHaveBeenCalledWith(agent, expect.any(AbortSignal));
+		},
+	);
+	it("does not execute when directory recovery fails", async () => {
+		const spawn = vi.fn();
+		await expect(
+			capturedSpawn(
+				"node",
+				[],
+				undefined,
+				{},
+				(ctx) => {
+					ctx.workingDirectory = {
+						ensure: async () => {
+							throw new Error("directory unavailable");
+						},
+					};
+					ctx.subprocess.spawn = spawn;
+				},
+				{ agent: { session: { header: { cwd: "/ws" } } } },
+			),
+		).rejects.toThrow("directory unavailable");
+		expect(spawn).not.toHaveBeenCalled();
+	});
+	it("does not replace the current directory with the immutable workspace when the service is missing", async () => {
+		const spawn = vi.fn();
+		await expect(
+			capturedSpawn(
+				"node",
+				[],
+				undefined,
+				{},
+				(ctx) => {
+					ctx.workingDirectory = undefined;
+					ctx.subprocess.spawn = spawn;
+				},
+				{ agent: { session: { header: { cwd: "/ws" } } } },
+			),
+		).rejects.toThrow();
+		expect(spawn).not.toHaveBeenCalled();
+	});
+	it("preserves executor defaults for agentless calls", async () => {
+		const result = await capturedSpawn("node", []);
+		expect(result.cwd).toBe("/tmp");
+	});
+});
+
+it("changing cwd does not expand sandbox write access", async () => {
+	const confine = vi.fn(async (argv: string[]) => ({
+		argv: ["runner", ...argv],
+		enforcement: "full",
+		denialSignatures: [],
+		runnerFailureRules: [],
+	}));
+	const result = await capturedSpawn(
+		"node",
+		[],
+		undefined,
+		{},
+		(ctx) => {
+			ctx.workingDirectory = { ensure: async () => "/outside/current" };
+			ctx.sandboxPolicy.resolve = () => ({
+				mode: "workspace-write",
+				workspaceRoot: "/ws",
+			});
+			ctx.sandbox.confine = confine;
+		},
+		{ agent: { session: { header: { cwd: "/ws" } } } },
+	);
+	expect(result.cwd).toBe("/outside/current");
+	expect(confine).toHaveBeenCalledWith(
+		expect.any(Array),
+		expect.objectContaining({ workspaceRoot: "/ws", mode: "workspace-write" }),
+		expect.any(AbortSignal),
+	);
 });

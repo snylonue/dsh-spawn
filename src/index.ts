@@ -19,6 +19,38 @@
  * @module dsh-spawn
  */
 import { isAbsolute, sep } from "node:path";
+import type { Context } from "@deepseek-ai/cordis";
+import type {
+	JobId,
+	JobOutcome,
+	JobRegistry,
+	JobView,
+} from "@deepseek-ai/dsh-jobs";
+import { HarnessError } from "@deepseek-ai/dsh-llm";
+import {
+	approveEscalation,
+	ESCALATION_TARGETS,
+	escalationHintMarker,
+	type SandboxExecutionPolicy,
+	type SandboxMode,
+	sandboxDenialMarker,
+	sandboxPermissionsDescription,
+	validateEscalationArgs,
+} from "@deepseek-ai/dsh-sandbox";
+// The empty type-only imports pull in each host package's Cordis `Context`
+// augmentation (`ctx.sandboxPolicy`, `ctx.subprocess`, `ctx.shellEnv`,
+// `ctx.systemPrompt`) without adding any of them to the runtime import graph.
+import type {} from "@deepseek-ai/dsh-sandbox-policy";
+import {
+	type CollectedOutput,
+	DSH_ENV_PREFIX,
+	type ShellExecSpec,
+	type ShellRunResult,
+	type ShellSandboxInfo,
+} from "@deepseek-ai/dsh-shell";
+import type {} from "@deepseek-ai/dsh-shell-env";
+import type {} from "@deepseek-ai/dsh-subprocess";
+import type {} from "@deepseek-ai/dsh-system-prompt";
 import {
 	defineTool,
 	TOOL_ABORTED,
@@ -28,39 +60,8 @@ import {
 	type ToolResultView,
 	type ToolRunContext,
 } from "@deepseek-ai/dsh-tools";
-import { HarnessError } from "@deepseek-ai/dsh-llm";
-import {
-	ESCALATION_TARGETS,
-	approveEscalation,
-	escalationHintMarker,
-	sandboxDenialMarker,
-	sandboxPermissionsDescription,
-	validateEscalationArgs,
-	type SandboxExecutionPolicy,
-	type SandboxMode,
-} from "@deepseek-ai/dsh-sandbox";
-import {
-	DSH_ENV_PREFIX,
-	type CollectedOutput,
-	type ShellExecSpec,
-	type ShellRunResult,
-	type ShellSandboxInfo,
-} from "@deepseek-ai/dsh-shell";
-import type {
-	JobId,
-	JobOutcome,
-	JobRegistry,
-	JobView,
-} from "@deepseek-ai/dsh-jobs";
-import type { Context } from "@deepseek-ai/cordis";
-import { runProgram, type ProgramExecution } from "./direct-exec.js";
-// The empty type-only imports pull in each host package's Cordis `Context`
-// augmentation (`ctx.sandboxPolicy`, `ctx.subprocess`, `ctx.shellEnv`,
-// `ctx.systemPrompt`) without adding any of them to the runtime import graph.
-import type {} from "@deepseek-ai/dsh-sandbox-policy";
-import type {} from "@deepseek-ai/dsh-subprocess";
-import type {} from "@deepseek-ai/dsh-shell-env";
-import type {} from "@deepseek-ai/dsh-system-prompt";
+import type {} from "@deepseek-ai/dsh-working-directory";
+import { type ProgramExecution, runProgram } from "./direct-exec.js";
 
 // ── host packages ────────────────────────────────────────────────────────────
 //
@@ -148,6 +149,7 @@ export const inject = [
 	"sandboxPolicy",
 	"systemPrompt",
 	"shellEnv",
+	"workingDirectory",
 ];
 
 /** Display form for cards; never executed, so no validation is needed. */
@@ -549,19 +551,11 @@ function presentSpawnResult(
 	};
 }
 
-/**
- * Resolve an explicit cwd first, making a relative one session-workspace-relative;
- * otherwise use the filesystem identity of the session cwd and leave executor
- * defaulting as the fallback. A resolved sandbox-policy root wins so cwd and
- * confinement use the exact same per-call identity.
- */
+/** Resolve cwd against the host-managed current directory, never the sandbox root. */
 function resolveWorkdir(
 	modelWorkdir: string | undefined,
-	spawn: ToolRunContext,
-	policyWorkspaceRoot: string | undefined,
+	sessionCwd: string | undefined,
 ): string | undefined {
-	const headerCwd = spawn.agent?.session.header.cwd;
-	const sessionCwd = policyWorkspaceRoot ?? headerCwd;
 	if (modelWorkdir === undefined) return sessionCwd;
 	if (sessionCwd !== undefined && !isAbsolute(modelWorkdir))
 		return `${sessionCwd}${sep}${modelWorkdir}`;
@@ -717,7 +711,7 @@ function spawnTool(ctx: Context): ToolDefinition {
 			cwd: {
 				type: "string",
 				description:
-					"Working directory; defaults to the session workspace; a relative path resolves against it.",
+					"Working directory; defaults to the current session directory; a relative path resolves against it.",
 			},
 			stdin: {
 				type: "string",
@@ -820,11 +814,11 @@ function spawnTool(ctx: Context): ToolDefinition {
 				spawn.agent === undefined ? {} : { session: spawn.agent.session },
 			);
 			validateSpawnArgs(args, standingPolicy.mode);
-			const workdir = resolveWorkdir(
-				args.cwd,
-				spawn,
-				standingPolicy.workspaceRoot,
-			);
+			const cwd =
+				spawn.agent === undefined
+					? undefined
+					: await ctx.workingDirectory.ensure(spawn.agent, spawn.signal);
+			const workdir = resolveWorkdir(args.cwd, cwd);
 			// Environment providers wrap these subprocess methods transparently.
 			// Resolve argv[0] in the execution world before any approval or spawn,
 			// so a missing program or a relative path fails here — not inside a job.

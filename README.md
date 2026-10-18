@@ -10,9 +10,13 @@ Install the npm package into a DSH profile after the release is published:
 dsh plugin --profile web add @snylonue/dsh-spawn
 ```
 
+## Supported host and working directory
+
+Only DSH 0.2.1-rc.2 is supported. `spawn`, `stat`, and `list_dir` require the host working-directory service, including directory changes and missing-directory recovery. Relative `cwd` overrides resolve against that current directory. The sandbox workspace root does not change. There is no older-host service probe or workspace/header cwd fallback.
+
 ## Tools and preset
 
-`spawn` requires the `jobs`, `sandbox`, and `sandboxPolicy` services. Every invocation starts a job; foreground calls wait for completion and move the job to the background on timeout. Infrastructure failures throw in foreground calls and settle background jobs as `failed`; nonzero command exits remain ordinary results.
+`spawn` requires the `jobs`, `sandbox`, `sandboxPolicy`, and `workingDirectory` services. Every invocation starts a job; foreground calls wait for completion and move the job to the background on timeout. Infrastructure failures throw in foreground calls and settle background jobs as `failed`; nonzero command exits remain ordinary results.
 
 The `@snylonue/dsh-spawn` entry registers only `spawn`. Load `@snylonue/dsh-spawn/stat` and `@snylonue/dsh-spawn/list-dir` separately for filesystem queries. The `PTC-spawn` preset enables all three by default. To disable either query tool in that preset, set `disabled: true` on its entry under `preset-ptc-spawn.config.plugins`:
 

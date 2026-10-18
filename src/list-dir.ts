@@ -1,11 +1,12 @@
 /** Independently configurable `list_dir` tool plugin. */
 import type { Context } from "@deepseek-ai/cordis";
+import type {} from "@deepseek-ai/dsh-fs";
 import {
 	defineTool,
 	type ToolDefinition,
 	type ToolRunContext,
 } from "@deepseek-ai/dsh-tools";
-import type {} from "@deepseek-ai/dsh-fs";
+import type {} from "@deepseek-ai/dsh-working-directory";
 
 /** The `list_dir` value. */
 interface ListDirEntry {
@@ -37,7 +38,7 @@ function listDirTool(ctx: Context): ToolDefinition {
 				type: "string",
 				required: true,
 				description:
-					"Directory to list; a relative path resolves against the session workspace.",
+					"Directory to list; a relative path resolves against the current session directory.",
 			},
 			depth: {
 				type: "integer",
@@ -85,7 +86,10 @@ function listDirTool(ctx: Context): ToolDefinition {
 		},
 		isConcurrencySafe: () => true,
 		async execute(args: PathArgs, spawn: ToolRunContext) {
-			const cwd = spawn.agent?.session.header.cwd;
+			const cwd =
+				spawn.agent === undefined
+					? undefined
+					: await ctx.workingDirectory.ensure(spawn.agent, spawn.signal);
 			const root = await ctx.fs.resolve(args.path, {
 				...(cwd !== undefined ? { cwd } : {}),
 				signal: spawn.signal,
@@ -122,7 +126,7 @@ function listDirTool(ctx: Context): ToolDefinition {
 }
 
 export const name = "tool-list-dir";
-export const inject = ["tools", "fs"];
+export const inject = ["tools", "fs", "workingDirectory"];
 
 export function apply(ctx: Context): void {
 	ctx.tools.register(listDirTool(ctx));

@@ -13,7 +13,12 @@ describe("spawn declaration", () => {
 	it("requires jobs and sandbox and always exposes their parameters", async () => {
 		const mod = await import(new URL("../dist/index.js", import.meta.url).href);
 		expect(mod.inject).toEqual(
-			expect.arrayContaining(["jobs", "sandbox", "sandboxPolicy"]),
+			expect.arrayContaining([
+				"jobs",
+				"sandbox",
+				"sandboxPolicy",
+				"workingDirectory",
+			]),
 		);
 		const { tool } = await composeSpawn();
 		expect(tool.parameters.properties.background.type).toBe("boolean");
