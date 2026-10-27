@@ -15,8 +15,9 @@ autoInstallPeers: false
 #     vitest bundles its own; the postinstall only verifies a binary the
 #     platform-specific package already ships.
 #   @deepseek-ai/dsh-subprocess-local, koffi, node-pty
-#     reachable only through the terminal path of the host packages used here;
-#     this plugin never opens a persistent terminal.
+#     native launch/terminal helpers are supplied by the DSH host, not built here.
+#     Windows code-page hints use lazy Koffi bindings and degrade to byte detection
+#     if unavailable; the encoding detector and codecs themselves are pure JS.
 allowBuilds:
   '@deepseek-ai/dsh-subprocess-local': false
   esbuild: false

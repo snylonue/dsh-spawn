@@ -66,8 +66,10 @@
 		"@deepseek-ai/dsh-shell": "0.2.1-rc.2",
 		"@deepseek-ai/dsh-shell-env": "0.2.1-rc.2",
 		"@deepseek-ai/dsh-subprocess": "0.2.1-rc.2",
+		"@deepseek-ai/dsh-subprocess-local": "0.2.1-rc.2",
 		"@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2",
 		"@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+		"@deepseek-ai/dsh-win32-process": "0.2.1-rc.2",
 		"@deepseek-ai/dsh-working-directory": "0.2.1-rc.2"
 	},
 	"devDependencies": {
@@ -98,6 +100,7 @@
 		"@deepseek-ai/dsh-tools": "0.2.1-rc.2",
 		"@deepseek-ai/dsh-typert-protocol": "0.2.1-rc.2",
 		"@deepseek-ai/dsh-util-values": "0.2.1-rc.2",
+		"@deepseek-ai/dsh-win32-process": "0.2.1-rc.2",
 		"@deepseek-ai/dsh-working-directory": "0.2.1-rc.2",
 		"@types/node": "^24.0.0",
 		"typescript": "^5.9.0",
@@ -108,6 +111,8 @@
 		"description": "A tool call to run programs directly by argv without a shell, with optional file metadata and directory tools."
 	},
 	"dependencies": {
+		"chardet": "2.2.0",
+		"iconv-lite": "0.7.3",
 		"ignore": "^7.0.12"
 	}
 }

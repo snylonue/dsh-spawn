@@ -1,3 +1,6 @@
+import { PassThrough, Readable } from "node:stream";
+import { readFileSync, unlinkSync } from "node:fs";
+import iconv from "iconv-lite";
 import { describe, expect, it, vi } from "vitest";
 import { createJobs } from "./helpers.js";
 
@@ -13,18 +16,7 @@ async function directExec(): Promise<Any> {
 	return import(new URL("../dist/direct-exec.js", import.meta.url).href);
 }
 
-/** An offset reader over a fixed string. */
-function reader(text: string) {
-	return {
-		readFrom: (from: number) => ({
-			text: text.slice(from),
-			nextOffset: text.length,
-			lossy: false,
-		}),
-	};
-}
-
-/** A provider handle exposing the collect readers the runner asks for. */
+/** A provider handle exposing the raw pipes the runner asks for. */
 function handle(
 	stdout: string,
 	stderr: string,
@@ -33,10 +25,10 @@ function handle(
 ) {
 	return {
 		stdin: undefined,
-		stdout: undefined,
-		stderr: undefined,
+		stdout: Readable.from([Buffer.from(stdout)]),
+		stderr: Readable.from([Buffer.from(stderr)]),
 		control: undefined,
-		collected: { stdout: reader(stdout), stderr: reader(stderr) },
+		collected: {},
 		done: Promise.resolve({ exitCode, signal }),
 		terminate: () => {},
 		waitForExit: async () => true,
@@ -429,6 +421,60 @@ async function capturedConfinedSpawn(
 }
 
 describe("spawn jobs", () => {
+	it("automatically decodes legacy foreground output without an encoding argument", async () => {
+		const text =
+			"这是中文程序输出，应该自动识别编码，而不是依赖模型提供参数。\n";
+		const spawned = {
+			...handle("", "", 0),
+			stdout: Readable.from([iconv.encode(text, "gbk")]),
+		};
+		const { result } = await capturedSpawn("node", [], spawned);
+		expect(result.stdout.text).toBe(text);
+	});
+
+	it("feeds decoded incremental output to registered background pull sources", async () => {
+		const pending = Promise.withResolvers<{ exitCode: number; signal: null }>();
+		const pipe = new PassThrough();
+		const firstText =
+			"这是中文程序输出，应该自动识别编码，而不是依赖模型提供参数。\n";
+		const spawned = {
+			...handle("", "", 0),
+			stdout: pipe,
+			done: pending.promise,
+		};
+		let sources: Any[] = [];
+		const { jobs, result } = await capturedSpawn(
+			"node",
+			[],
+			spawned,
+			{ background: true },
+			(ctx) => {
+				const start = ctx.jobs.start;
+				ctx.jobs.start = (request: Any) => {
+					sources = request.output;
+					return start(request);
+				};
+			},
+		);
+		try {
+			expect(result.kind).toBe("background");
+			const source = sources.find((source) => source.channel === "stdout");
+			pipe.write(iconv.encode(firstText, "gbk"));
+			const first = source.read(0);
+			expect(first).toMatchObject({
+				text: firstText,
+				nextOffset: Buffer.byteLength(firstText),
+				lossy: false,
+			});
+			pipe.write(Buffer.from("d6d0cec40a", "hex"));
+			expect(source.read(first.nextOffset).text).toBe("中文\n");
+			expect(source.read(0).text).toBe(firstText + "中文\n");
+		} finally {
+			pending.resolve({ exitCode: 0, signal: null });
+			await jobs.wait(result.jobId, 1000);
+		}
+	});
+
 	it.each(["throw", "reject"])(
 		"reports provider failures in foreground and background (%s)",
 		async (failure) => {
@@ -617,28 +663,34 @@ describe("spawn compact results", () => {
 		},
 	);
 
-	it("retains truncation and spill facts even with empty captured stderr", async () => {
-		const spawned = handle("tail", "", 0);
-		spawned.collected.stdout.readFrom = () => ({
-			text: "tail",
-			nextOffset: 100,
-			lossy: true,
-			spillPath: "/tmp/out-spill",
-		});
-		spawned.collected.stderr.readFrom = () => ({
-			text: "",
-			nextOffset: 100,
-			lossy: true,
-			spillPath: "/tmp/err-spill",
-		});
-		const { result, rendered } = await capturedSpawn("node", [], spawned);
-		expect(result).toEqual({
-			kind: "foreground",
-			exitCode: 0,
-			stdout: { text: "tail", truncated: true, spillPath: "/tmp/out-spill" },
-			stderr: { text: "", truncated: true, spillPath: "/tmp/err-spill" },
-		});
-		expect(rendered).toEqual(result);
+	it("retains truncation and spill facts even with empty captured text", async () => {
+		const { result, rendered } = await capturedSpawn(
+			"node",
+			[],
+			handle("tail", "error", 0),
+			{},
+			(ctx) => {
+				const resolve = ctx.shell.resolve;
+				ctx.shell.resolve = (request: Any) => ({
+					...resolve(request),
+					stdoutMaxBytes: 0,
+				});
+			},
+		);
+		try {
+			expect(result).toEqual({
+				kind: "foreground",
+				exitCode: 0,
+				stdout: { text: "", truncated: true, spillPath: expect.any(String) },
+				stderr: { text: "", truncated: true, spillPath: expect.any(String) },
+			});
+			expect(readFileSync(result.stdout.spillPath, "utf8")).toBe("tail");
+			expect(readFileSync(result.stderr.spillPath, "utf8")).toBe("error");
+			expect(rendered).toEqual(result);
+		} finally {
+			if (result.stdout.spillPath) unlinkSync(result.stdout.spillPath);
+			if (result.stderr.spillPath) unlinkSync(result.stderr.spillPath);
+		}
 	});
 });
 

@@ -13,6 +13,12 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import {
+	prepareManagedProcessBinding,
+	logSpillFailure,
+} from "@deepseek-ai/dsh-subprocess-local/output";
+import { DecodedOutputCollector, bindOutputStream } from "./output-capture.js";
+import { outputEncodingHints } from "./output-encoding.js";
+import {
 	SandboxUnavailableError,
 	classifyRunnerFailure,
 	isRunnerSpawnFailure,
@@ -130,6 +136,32 @@ export async function runProgram(
 		throw error;
 	};
 
+	// Capture raw pipes ourselves: provider collect readers have already assumed UTF-8.
+	const env = { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv };
+	const hints = outputEncodingHints({ ...process.env, ...env });
+	const binding = prepareManagedProcessBinding(
+		ctx.logger === undefined
+			? {}
+			: { onSpillFailure: logSpillFailure(ctx.logger, "dsh-spawn") },
+	);
+	const spill = {
+		maxBytes: DEFAULT_MAX_SPILL_BYTES,
+		dir: binding.spillDir,
+		onFailure: binding.onSpillFailure,
+	};
+	const stdout = new DecodedOutputCollector(
+		spec.stdoutMaxBytes,
+		"stdout",
+		hints,
+		spill,
+	);
+	const stderr = new DecodedOutputCollector(
+		spec.stdoutMaxBytes,
+		"stderr",
+		hints,
+		spill,
+	);
+
 	let running: SubprocessHandle;
 	try {
 		spawnSignal?.throwIfAborted();
@@ -138,34 +170,45 @@ export async function runProgram(
 			cwd: spec.workdir,
 			stdio: {
 				stdin: spec.stdin !== undefined ? { data: spec.stdin } : "ignore",
-				stdout: {
-					maxBytes: spec.stdoutMaxBytes,
-					spill: { maxBytes: DEFAULT_MAX_SPILL_BYTES },
-				},
-				stderr: {
-					maxBytes: spec.stdoutMaxBytes,
-					spill: { maxBytes: DEFAULT_MAX_SPILL_BYTES },
-				},
+				stdout: "pipe",
+				stderr: "pipe",
 			},
 			graceMs: DEFAULT_GRACE_MS,
 			signal: spawnSignal,
-			env: { ...ENV_OVERRIDES, ...spec.env, ...spec.dshEnv },
+			env,
 		});
 	} catch (error) {
+		stdout.seal();
+		stderr.seal();
 		return spawnFailure(error);
 	}
 
-	const { stdout, stderr } = running.collected;
-	if (stdout === undefined || stderr === undefined) {
+	if (running.stdout === undefined || running.stderr === undefined) {
+		running.terminate();
+		running.stdout?.destroy();
+		running.stderr?.destroy();
+		stdout.seal();
+		stderr.seal();
+		void running.done.catch(() => {});
 		throw new Error(
-			"dsh-spawn: the subprocess provider dropped a requested collect stream",
+			"dsh-spawn: the subprocess provider dropped a requested raw pipe",
 		);
 	}
+	const stopStdout = bindOutputStream(running.stdout, stdout);
+	const stopStderr = bindOutputStream(running.stderr, stderr);
 
 	return {
 		observed: { stdout, stderr },
 		kill: () => running.terminate(),
 		result: running.done
+			.finally(() => {
+				// Mirror provider collect-mode cleanup, including a survivor holding a pipe open.
+				try {
+					stopStdout();
+				} finally {
+					stopStderr();
+				}
+			})
 			.catch((error) => {
 				// Cancellation may reject instead of returning exit facts.
 				if (spawnSignal?.aborted) return { exitCode: null, signal: null };

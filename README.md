@@ -14,6 +14,14 @@ dsh plugin --profile web add @snylonue/dsh-spawn
 
 Only DSH 0.2.1-rc.2 is supported. `spawn`, `stat`, and `list_dir` require the host working-directory service, including directory changes and missing-directory recovery. Relative `cwd` overrides resolve against that current directory. The sandbox workspace root does not change. There is no older-host service probe or workspace/header cwd fallback.
 
+## Output encoding
+
+`spawn` automatically decodes stdout and stderr independently on every OS. It captures raw pipes, recognizes UTF-8/UTF-16/UTF-32 BOMs, prefers strictly valid UTF-8, and otherwise detects a supported legacy encoding. High-confidence detection takes precedence over platform hints; ambiguous samples use Windows ACP/console/OEM code pages or the effective POSIX locale (`LC_ALL`, then `LC_CTYPE`, then `LANG`). Locale hints reflect explicit child `env` overrides. No encoding environment variables, system code pages, target application settings, or tool-call encoding parameters are changed or added.
+
+ASCII output is delivered immediately without locking a later non-ASCII line to UTF-8. Legacy detection buffers at most 8 KiB and selects an encoding on a newline, the sample limit, or EOF, without a timer; incomplete characters are carried across chunks. Short legacy output without a newline remains buffered until more bytes arrive or the stream ends. Foreground results and background readers share the same decoding path. The output budget, reader byte offsets, and complete spill files use **normalized UTF-8**, so spills can be read by ordinary UTF-8 file tools. Truncated tails drop an incomplete leading character rather than displaying a replacement caused by truncation.
+
+Detection is heuristic: very short ambiguous text or multiple encodings mixed in one stream cannot always be identified. Programs producing binary output should write it to a file rather than relying on this text tool. Windows native code-page lookup is optional metadata; decoding still works if it is unavailable.
+
 ## Directory ignore rules
 
 `list_dir` uses ripgrep-style **project-level** filters by default. `ignore` and `hidden` are independent options:
