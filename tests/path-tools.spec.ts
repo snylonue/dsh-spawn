@@ -88,6 +88,8 @@ it.each([
 				return { displayPath: options.cwd };
 			},
 			stat: async () => undefined,
+			processPath: (target: any) => target.displayPath,
+			lstat: async () => undefined,
 			listDir: async () => [],
 		});
 		try {
@@ -115,6 +117,8 @@ it.each([
 		Object.assign(ctx.fs, {
 			resolve,
 			stat: async () => undefined,
+			processPath: (target: any) => target.displayPath,
+			lstat: async () => undefined,
 			listDir: async () => [],
 		});
 		try {

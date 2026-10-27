@@ -7,6 +7,13 @@ import {
 	type ToolRunContext,
 } from "@deepseek-ai/dsh-tools";
 import type {} from "@deepseek-ai/dsh-working-directory";
+import {
+	ancestorIgnoreState,
+	descendIgnoreScopes,
+	directoryIgnoreState,
+	type IgnoreState,
+	matchIgnoreRules,
+} from "./gitignore.js";
 
 /** The `list_dir` value. */
 interface ListDirEntry {
@@ -20,10 +27,12 @@ interface ListDirValue {
 	truncated: boolean;
 }
 
-/** The one path/name argument the query tools take. */
+/** Directory query options. */
 interface PathArgs {
 	path: string;
 	depth?: number;
+	ignore?: boolean;
+	hidden?: boolean;
 }
 
 const LIST_DIR_MAX_ENTRIES = 2000;
@@ -34,6 +43,16 @@ function listDirTool(ctx: Context): ToolDefinition {
 		name: "list_dir",
 		description: `List a directory's entries, one level deep by default; \`depth\` recurses up to ${LIST_DIR_MAX_DEPTH} levels. Results stop at ${LIST_DIR_MAX_ENTRIES} entries and report \`truncated\`.`,
 		parameters: {
+			ignore: {
+				type: "boolean",
+				description:
+					"Apply .gitignore, .ignore, .rgignore and repository exclude rules, and skip symbolic links. Defaults to true. Hidden entries are controlled separately by hidden.",
+			},
+			hidden: {
+				type: "boolean",
+				description:
+					"Include hidden files and directories; defaults to false. Ignore rules still apply. Explicit ignore-file whitelists can include hidden entries even when false.",
+			},
 			path: {
 				type: "string",
 				required: true,
@@ -95,14 +114,53 @@ function listDirTool(ctx: Context): ToolDefinition {
 				signal: spawn.signal,
 			});
 			const depth = Math.max(1, Math.min(LIST_DIR_MAX_DEPTH, args.depth ?? 1));
-			const entries = [];
+			const entries: ListDirEntry[] = [];
 			let truncated = false;
-			let level = [{ target: root, depth: 1 }];
+			const applyIgnore = args.ignore ?? true;
+			const includeHidden = args.hidden ?? false;
+			const state: IgnoreState = applyIgnore
+				? await ancestorIgnoreState(ctx.fs, root, spawn.signal)
+				: { scopes: [], inRepository: false };
+			let level = [{ target: root, depth: 1, state }];
 			while (level.length > 0 && !truncated) {
 				const next = [];
 				for (const item of level) {
+					spawn.signal.throwIfAborted();
 					const children = await ctx.fs.listDir(item.target, spawn.signal);
+					const directory = applyIgnore ? ctx.fs.processPath(item.target) : "";
+					const state = applyIgnore
+						? await directoryIgnoreState(
+								ctx.fs,
+								directory,
+								item.state,
+								spawn.signal,
+							)
+						: item.state;
 					for (const child of children) {
+						const ignored = applyIgnore
+							? matchIgnoreRules(
+									state.scopes,
+									child.name,
+									child.type === "directory",
+								)
+							: undefined;
+						if (ignored === true) continue;
+						// Preserve rg-style explicit whitelists without coupling the two flags.
+						if (
+							!includeHidden &&
+							ignored !== false &&
+							child.name.startsWith(".")
+						)
+							continue;
+						if (applyIgnore) {
+							// listDir targets follow links; probe the original entry, not its target.
+							const info = await ctx.fs.lstat(
+								child.name,
+								{ cwd: directory },
+								spawn.signal,
+							);
+							if (info?.type === "symlink") continue;
+						}
 						if (entries.length >= LIST_DIR_MAX_ENTRIES) {
 							truncated = true;
 							break;
@@ -113,7 +171,14 @@ function listDirTool(ctx: Context): ToolDefinition {
 							...(child.size !== undefined ? { size: child.size } : {}),
 						});
 						if (item.depth < depth && child.type === "directory") {
-							next.push({ target: child.target, depth: item.depth + 1 });
+							next.push({
+								target: child.target,
+								depth: item.depth + 1,
+								state: {
+									scopes: descendIgnoreScopes(state.scopes, child.name),
+									inRepository: state.inRepository,
+								},
+							});
 						}
 					}
 					if (truncated) break;
