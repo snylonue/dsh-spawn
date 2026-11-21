@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.0.2
+
+- Add DSH `0.2.2-rc.5` to the host engine and DSH SDK peer support declarations; retain rc.2 and rc.3 support.
+- Keep the rc.2 build dependency baseline and runtime behavior unchanged.
+
 ## 4.0.1
 
 - Declare DSH `0.2.2-rc.2 || 0.2.2-rc.3` support in host engines and DSH SDK peers.
